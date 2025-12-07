@@ -1,0 +1,1325 @@
+/*
+ * Easylogger M5AtomS3 + Mode Datalogger
+ * BDP France - Version 2.0
+ * 
+ * Modes de fonctionnement:
+ * 1. Standalone: Affichage local uniquement (comme avant)
+ * 2. Datalogger: Connexion au Tab5 + affichage local + envoi WebSocket
+ * 
+ * Nouveau dans v2.0:
+ * - Mode Datalogger avec WebSocket Client
+ * - Configuration device_id, tab5_ssid, tab5_pass
+ * - Envoi automatique des données au Tab5
+ * - Comportement dual: local + remote
+ */
+
+#include "M5AtomS3.h"
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <DNSServer.h>
+#include <ESPmDNS.h>
+#include <time.h>
+#include <WebSocketsClient.h>  // NOUVEAU
+
+// -------- RS232 (base M5 RS232) --------
+static const int PIN_RX = 5, PIN_TX = 6;
+static const uint32_t LINE_TIMEOUT_MS = 300;
+
+// Types de balances
+enum class BalanceType { AandD = 0, Sartorius = 1 };
+
+// NOUVEAU: Modes de fonctionnement
+enum class DeviceMode { Standalone = 0, Datalogger = 1 };
+
+// -------- UI / NTP --------
+static const uint32_t IDLE_REFRESH_MS = 1000;
+const char* TZ_EUROPE_PARIS = "CET-1CEST,M3.5.0/2,M10.5.0/3";
+#define COL_GRAY 0x7BEF
+
+// -------- Buffers --------
+char lineBuf[64];
+size_t lineLen = 0;
+uint32_t lastByteMs = 0;
+
+// -------- Config persistée --------
+struct AppConfig {
+  // Wi-Fi
+  bool   client_enabled = false;
+  char   ssid[33] = "";
+  char   pass[65] = "";
+
+  // IP
+  bool   ip_dhcp = true;
+  char   ip[16]   = "";
+  char   mask[16] = "";
+  char   gw[16]   = "";
+  char   dns[16]  = "";
+
+  // UI
+  char   title[17]    = "Easylogger";
+  char   idleText[17] = "En attente";
+  uint8_t fontMain    = 1;
+  uint32_t showWeightMs = 2000;
+  bool   showWifiIndicator = true;
+  uint8_t dtFormat = 0;
+
+  // Balance
+  uint8_t balanceType = 0;
+  uint32_t balanceBaud = 2400;
+  bool swapRxTx = false;
+  uint8_t dataBits = 7;
+  uint8_t parity = 1;
+  uint8_t stopBits = 1;
+  uint8_t handshake = 0;
+  char terminator[5] = "\r\n";
+  
+  // NOUVEAU: Datalogger
+  uint8_t deviceMode = 0;             // 0=Standalone, 1=Datalogger
+  char device_id[17] = "ATOMS3_001";  // Identifiant unique
+  char tab5_ssid[33] = "Datalogger-"; // SSID du Tab5
+  char tab5_pass[65] = "datalogger";  // Mot de passe Tab5
+  char tab5_ip[16] = "192.168.4.1";   // IP du Tab5 (défaut AP)
+  
+  // NOUVEAU: Connexion automatique au réseau StamPLC
+  bool autoConnectStamPLC = true;     // Se connecter automatiquement au réseau du StamPLC
+  char stamplc_ssid[33] = "Wifi Unifi"; // SSID du réseau StamPLC
+  char stamplc_pass[65] = "Wrangler2012."; // Mot de passe du réseau StamPLC
+} cfg;
+
+Preferences prefs;
+WebServer server(80);
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
+bool dnsRunning = false;
+
+// NOUVEAU: WebSocket Client
+WebSocketsClient wsClient;
+bool wsConnected = false;
+bool wifiConnectedToTab5 = false;  // État de la connexion WiFi au Tab5
+uint32_t lastWsReconnectAttempt = 0;
+uint32_t lastWiFiReconnectAttempt = 0;
+const uint32_t WS_RECONNECT_INTERVAL = 10000;  // Tentative tous les 10s
+const uint32_t WIFI_RECONNECT_INTERVAL = 15000;  // Tentative WiFi tous les 15s
+
+enum class UiMode { IdleClock, ShowWeight, ConfirmFactory, SplashStaInfo, InfoOverlay, InfoSecrets };
+UiMode uiMode = UiMode::IdleClock;
+uint32_t modeEnteredAt = 0;
+bool wifiOK = false, timeReady = false;
+
+String lastWeight = "";
+uint32_t lastWeightMs = 0;
+
+String currentAPSSID;
+String hostName;
+
+// Bouton
+bool btnPressed = false;
+uint32_t btnPressStart = 0;
+const uint32_t LONG_PRESS_MS = 8000;  // 8 secondes pour reset usine
+const uint32_t CONFIRM_WINDOW_MS = 6000;
+uint32_t confirmStartMs = 0;
+
+// Triple-clic
+uint8_t  clickCount = 0;
+uint32_t firstClickAt = 0;
+const uint32_t CLICK_WINDOW_MS = 500;
+uint32_t infoExpiresAt = 0;
+
+// ===== Utils =====
+String macSuffix() {
+  uint8_t mac[6]; WiFi.macAddress(mac);
+  char b[9]; snprintf(b, sizeof(b), "%02X%02X", mac[4], mac[5]);
+  return String(b);
+}
+
+String macAddress() {
+  uint8_t mac[6]; WiFi.macAddress(mac);
+  char b[18]; 
+  snprintf(b, sizeof(b), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  return String(b);
+}
+
+// ===== Paramètres Balance =====
+uint32_t getBalanceBaud() {
+  return cfg.balanceBaud;
+}
+
+int getBalanceSerialConfig() {
+  char parityChar;
+  switch (cfg.parity) {
+    case 1: parityChar = 'E'; break;
+    case 2: parityChar = 'O'; break;
+    default: parityChar = 'N'; break;
+  }
+  
+  uint8_t data = constrain(cfg.dataBits, 5, 8);
+  uint8_t stop = (cfg.stopBits == 2) ? 2 : 1;
+  
+  if (parityChar == 'N') {
+    if (data == 5 && stop == 1) return SERIAL_5N1;
+    if (data == 6 && stop == 1) return SERIAL_6N1;
+    if (data == 7 && stop == 1) return SERIAL_7N1;
+    if (data == 8 && stop == 1) return SERIAL_8N1;
+    if (data == 5 && stop == 2) return SERIAL_5N2;
+    if (data == 6 && stop == 2) return SERIAL_6N2;
+    if (data == 7 && stop == 2) return SERIAL_7N2;
+    if (data == 8 && stop == 2) return SERIAL_8N2;
+  } else if (parityChar == 'E') {
+    if (data == 5 && stop == 1) return SERIAL_5E1;
+    if (data == 6 && stop == 1) return SERIAL_6E1;
+    if (data == 7 && stop == 1) return SERIAL_7E1;
+    if (data == 8 && stop == 1) return SERIAL_8E1;
+    if (data == 5 && stop == 2) return SERIAL_5E2;
+    if (data == 6 && stop == 2) return SERIAL_6E2;
+    if (data == 7 && stop == 2) return SERIAL_7E2;
+    if (data == 8 && stop == 2) return SERIAL_8E2;
+  } else if (parityChar == 'O') {
+    if (data == 5 && stop == 1) return SERIAL_5O1;
+    if (data == 6 && stop == 1) return SERIAL_6O1;
+    if (data == 7 && stop == 1) return SERIAL_7O1;
+    if (data == 8 && stop == 1) return SERIAL_8O1;
+    if (data == 5 && stop == 2) return SERIAL_5O2;
+    if (data == 6 && stop == 2) return SERIAL_6O2;
+    if (data == 7 && stop == 2) return SERIAL_7O2;
+    if (data == 8 && stop == 2) return SERIAL_8O2;
+  }
+  
+  return SERIAL_8N1;
+}
+
+int getBalanceRxPin() {
+  return cfg.swapRxTx ? PIN_TX : PIN_RX;
+}
+
+int getBalanceTxPin() {
+  return cfg.swapRxTx ? PIN_RX : PIN_TX;
+}
+
+String getBalanceCommand() {
+  String cmd;
+  if (cfg.balanceType == (uint8_t)BalanceType::AandD) {
+    cmd = "Q";
+  } else {
+    cmd = "P";
+  }
+  cmd += String(cfg.terminator);
+  return cmd;
+}
+
+IPAddress ipFrom(const char* s) {
+  IPAddress ip; ip.fromString((String)s);
+  return ip;
+}
+
+void saveConfig() {
+  prefs.begin("easylog");
+  // Wi-Fi
+  prefs.putBool("cli", cfg.client_enabled);
+  prefs.putString("ssid", cfg.ssid);
+  prefs.putString("pass", cfg.pass);
+  // IP
+  prefs.putBool("dhcp", cfg.ip_dhcp);
+  prefs.putString("ip",   cfg.ip);
+  prefs.putString("mask", cfg.mask);
+  prefs.putString("gw",   cfg.gw);
+  prefs.putString("dns",  cfg.dns);
+  // UI
+  prefs.putString("title", cfg.title);
+  prefs.putString("idle",  cfg.idleText);
+  prefs.putUChar("fmain",  cfg.fontMain);
+  prefs.putUInt("showms",  cfg.showWeightMs);
+  prefs.putBool("wifiind", cfg.showWifiIndicator);
+  prefs.putUChar("dtfmt",  cfg.dtFormat);
+  // Balance
+  prefs.putUChar("btype",  cfg.balanceType);
+  prefs.putUInt("bbaud",   cfg.balanceBaud);
+  prefs.putBool("swaprt",  cfg.swapRxTx);
+  prefs.putUChar("dbits",  cfg.dataBits);
+  prefs.putUChar("parity",  cfg.parity);
+  prefs.putUChar("stop",    cfg.stopBits);
+  prefs.putUChar("hshake",  cfg.handshake);
+  prefs.putString("term",   cfg.terminator);
+  // NOUVEAU: Datalogger
+  prefs.putUChar("devmode", cfg.deviceMode);
+  prefs.putString("devid",  cfg.device_id);
+  prefs.putString("t5ssid", cfg.tab5_ssid);
+  prefs.putString("t5pass", cfg.tab5_pass);
+  prefs.putString("t5ip",   cfg.tab5_ip);
+  // NOUVEAU: Connexion automatique StamPLC
+  prefs.putBool("autostamplc", cfg.autoConnectStamPLC);
+  prefs.putString("stamplcssid", cfg.stamplc_ssid);
+  prefs.putString("stamplcpass", cfg.stamplc_pass);
+  prefs.end();
+}
+
+void loadConfig() {
+  prefs.begin("easylog");
+  // Wi-Fi
+  cfg.client_enabled = prefs.getBool("cli", false);
+  String s = prefs.getString("ssid", ""); s.toCharArray(cfg.ssid, sizeof(cfg.ssid));
+  s = prefs.getString("pass", ""); s.toCharArray(cfg.pass, sizeof(cfg.pass));
+  // IP
+  cfg.ip_dhcp = prefs.getBool("dhcp", true);
+  prefs.getString("ip","").toCharArray(cfg.ip,sizeof(cfg.ip));
+  prefs.getString("mask","").toCharArray(cfg.mask,sizeof(cfg.mask));
+  prefs.getString("gw","").toCharArray(cfg.gw,sizeof(cfg.gw));
+  prefs.getString("dns","").toCharArray(cfg.dns,sizeof(cfg.dns));
+  // UI
+  s = prefs.getString("title", "Easylogger"); s.toCharArray(cfg.title, sizeof(cfg.title));
+  s = prefs.getString("idle", "En attente"); s.toCharArray(cfg.idleText, sizeof(cfg.idleText));
+  cfg.fontMain = prefs.getUChar("fmain", 1);
+  cfg.showWeightMs = prefs.getUInt("showms", 2000);
+  cfg.showWifiIndicator = prefs.getBool("wifiind", true);
+  int legacy = prefs.getBool("dtdate", true) ? 0 : 2;
+  cfg.dtFormat = prefs.getUChar("dtfmt", (uint8_t)legacy);
+  // Balance
+  cfg.balanceType = prefs.getUChar("btype", 0);
+  cfg.balanceBaud = prefs.getUInt("bbaud", 2400);
+  cfg.swapRxTx = prefs.getBool("swaprt", false);
+  cfg.dataBits = prefs.getUChar("dbits", 7);
+  cfg.parity = prefs.getUChar("parity", 1);
+  cfg.stopBits = prefs.getUChar("stop", 1);
+  cfg.handshake = prefs.getUChar("hshake", 0);
+  s = prefs.getString("term", "\r\n"); s.toCharArray(cfg.terminator, sizeof(cfg.terminator));
+  // NOUVEAU: Datalogger (par défaut en mode Standalone pour reset usine complet)
+  cfg.deviceMode = prefs.getUChar("devmode", 0);  // Par défaut: Standalone (mode AP d'origine)
+  s = prefs.getString("devid", "ATOMS3_001"); s.toCharArray(cfg.device_id, sizeof(cfg.device_id));
+  s = prefs.getString("t5ssid", "Datalogger-"); s.toCharArray(cfg.tab5_ssid, sizeof(cfg.tab5_ssid));
+  s = prefs.getString("t5pass", "datalogger"); s.toCharArray(cfg.tab5_pass, sizeof(cfg.tab5_pass));
+  s = prefs.getString("t5ip", "192.168.4.1"); s.toCharArray(cfg.tab5_ip, sizeof(cfg.tab5_ip));
+  // NOUVEAU: Connexion automatique StamPLC
+  cfg.autoConnectStamPLC = prefs.getBool("autostamplc", true);  // Par défaut: activé
+  s = prefs.getString("stamplcssid", "Wifi Unifi"); s.toCharArray(cfg.stamplc_ssid, sizeof(cfg.stamplc_ssid));
+  s = prefs.getString("stamplcpass", "Wrangler2012."); s.toCharArray(cfg.stamplc_pass, sizeof(cfg.stamplc_pass));
+  prefs.end();
+
+  cfg.fontMain = constrain(cfg.fontMain, (uint8_t)1, (uint8_t)3);
+  cfg.dtFormat = constrain(cfg.dtFormat, (uint8_t)0, (uint8_t)7);
+  if (cfg.showWeightMs < 300) cfg.showWeightMs = 300;
+  cfg.balanceType = constrain(cfg.balanceType, (uint8_t)0, (uint8_t)1);
+  if (cfg.balanceBaud < 600) cfg.balanceBaud = 2400;
+  cfg.dataBits = constrain(cfg.dataBits, (uint8_t)5, (uint8_t)8);
+  cfg.parity = constrain(cfg.parity, (uint8_t)0, (uint8_t)2);
+  cfg.stopBits = (cfg.stopBits == 2) ? 2 : 1;
+  cfg.handshake = constrain(cfg.handshake, (uint8_t)0, (uint8_t)2);
+  if (strlen(cfg.terminator) == 0) strcpy(cfg.terminator, "\r\n");
+  cfg.deviceMode = constrain(cfg.deviceMode, (uint8_t)0, (uint8_t)1);
+  
+  if (cfg.balanceType == (uint8_t)BalanceType::AandD && cfg.balanceBaud == 2400) {
+    // OK
+  } else if (cfg.balanceType == (uint8_t)BalanceType::Sartorius && cfg.balanceBaud == 2400) {
+    cfg.balanceBaud = 9600;
+  }
+}
+
+String nowDateTime() {
+  if (!timeReady) {
+    uint32_t s = millis()/1000UL;
+    char b[28];
+    switch (cfg.dtFormat) {
+      case 2: case 5: case 6:
+        snprintf(b, sizeof(b), "%02lu:%02lu:%02lu",
+                 (unsigned long)((s/3600UL)%24UL),(unsigned long)((s/60UL)%60UL),(unsigned long)(s%60UL));
+        break;
+      case 3: case 7:
+        snprintf(b, sizeof(b), "%02lu:%02lu",
+                 (unsigned long)((s/3600UL)%24UL),(unsigned long)((s/60UL)%60UL));
+        break;
+      case 4:
+        return "----/--/--";
+      default:
+        snprintf(b, sizeof(b), "----/--/-- %02lu:%02lu:%02lu",
+                 (unsigned long)((s/3600UL)%24UL),(unsigned long)((s/60UL)%60UL),(unsigned long)(s%60UL));
+        break;
+    }
+    return String(b);
+  }
+  time_t tnow = time(nullptr);
+  if (tnow < 1700000000) return "--:--:--";
+  struct tm info; localtime_r(&tnow, &info);
+  char buf[28];
+  switch (cfg.dtFormat) {
+    case 1: strftime(buf, sizeof(buf), "%d/%m/%Y %H:%M:%S", &info); break;
+    case 2: strftime(buf, sizeof(buf), "%H:%M:%S", &info); break;
+    case 3: strftime(buf, sizeof(buf), "%H:%M", &info); break;
+    case 4: strftime(buf, sizeof(buf), "%Y-%m-%d", &info); break;
+    case 5: strftime(buf, sizeof(buf), "%H:%M:%S %Y-%m-%d", &info); break;
+    case 6: strftime(buf, sizeof(buf), "%H:%M:%S %d/%m/%Y", &info); break;
+    case 7: strftime(buf, sizeof(buf), "%H:%M %Y-%m-%d", &info); break;
+    default: strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &info); break;
+  }
+  return String(buf);
+}
+
+// ===== NOUVEAU: WebSocket Client =====
+void wsClientEvent(WStype_t type, uint8_t * payload, size_t length) {
+  switch(type) {
+    case WStype_DISCONNECTED:
+      Serial.println("[WS] Déconnecté du Tab5");
+      wsConnected = false;
+      break;
+      
+    case WStype_CONNECTED:
+      Serial.printf("[WS] Connecté au Tab5: %s\n", payload);
+      wsConnected = true;
+      break;
+      
+    case WStype_TEXT:
+      Serial.printf("[WS] Message reçu: %s\n", payload);
+      break;
+      
+    default:
+      break;
+  }
+}
+
+// Scan WiFi pour trouver automatiquement le réseau Tab5
+String scanForTab5Network() {
+  Serial.println("[Scan] Recherche du réseau Tab5...");
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  
+  int n = WiFi.scanNetworks();
+  Serial.printf("[Scan] %d réseaux trouvés\n", n);
+  
+  String foundSSID = "";
+  int bestRSSI = -1000;
+  
+  // Chercher les réseaux commençant par "Datalogger-"
+  String prefix = String(cfg.tab5_ssid);
+  if (prefix.length() == 0) {
+    prefix = "Datalogger-";
+  }
+  
+  for (int i = 0; i < n; i++) {
+    String ssid = WiFi.SSID(i);
+    int rssi = WiFi.RSSI(i);
+    
+    Serial.printf("[Scan] %s (RSSI: %d)\n", ssid.c_str(), rssi);
+    
+    // Vérifier si le SSID correspond (exact ou commence par le préfixe)
+    if (ssid == String(cfg.tab5_ssid) || 
+        (strlen(cfg.tab5_ssid) == 0 && ssid.startsWith(prefix))) {
+      if (rssi > bestRSSI) {
+        bestRSSI = rssi;
+        foundSSID = ssid;
+      }
+    }
+  }
+  
+  if (foundSSID.length() > 0) {
+    Serial.printf("[Scan] Réseau Tab5 trouvé: %s (RSSI: %d)\n", foundSSID.c_str(), bestRSSI);
+    return foundSSID;
+  } else {
+    Serial.println("[Scan] Aucun réseau Tab5 trouvé");
+    return "";
+  }
+}
+
+bool connectToTab5() {
+  if (cfg.deviceMode != (uint8_t)DeviceMode::Datalogger) {
+    return false;  // Mode standalone, pas de connexion
+  }
+  
+  String ssidToUse = String(cfg.tab5_ssid);
+  
+  // Si le SSID n'est pas configuré ou si la connexion échoue, scanner
+  if (ssidToUse.length() == 0 || WiFi.status() != WL_CONNECTED) {
+    String foundSSID = scanForTab5Network();
+    if (foundSSID.length() > 0) {
+      ssidToUse = foundSSID;
+      // Sauvegarder le SSID trouvé pour la prochaine fois
+      foundSSID.toCharArray(cfg.tab5_ssid, sizeof(cfg.tab5_ssid));
+      saveConfig();
+    } else if (ssidToUse.length() == 0) {
+      Serial.println("[Datalogger] SSID Tab5 non configuré et non trouvé par scan");
+      return false;
+    }
+  }
+  
+  Serial.printf("[Datalogger] Connexion au Tab5: %s\n", ssidToUse.c_str());
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(100);
+  WiFi.begin(ssidToUse.c_str(), cfg.tab5_pass);
+  
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 10000) {
+    delay(100);
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[Datalogger] WiFi OK. IP: %s\n", WiFi.localIP().toString().c_str());
+    wifiConnectedToTab5 = true;
+    
+    // Connexion WebSocket
+    String wsUrl = String(cfg.tab5_ip);
+    wsClient.begin(wsUrl, 81, "/");  // Port 81
+    wsClient.onEvent(wsClientEvent);
+    wsClient.setReconnectInterval(5000);
+    
+    Serial.println("[Datalogger] WebSocket configuré");
+    return true;
+  } else {
+    Serial.println("[Datalogger] Echec connexion WiFi Tab5");
+    wifiConnectedToTab5 = false;
+    return false;
+  }
+}
+
+void sendToTab5(const String& dataRaw) {
+  if (cfg.deviceMode != (uint8_t)DeviceMode::Datalogger) return;
+  if (!wsConnected) return;
+  
+  // Construction JSON
+  // NOTE: Pas de timestamp - la Tab5 est la seule source de vérité pour l'horloge
+  String json = "{";
+  json += "\"device_id\":\"" + String(cfg.device_id) + "\",";
+  json += "\"mac\":\"" + macAddress() + "\",";
+  json += "\"data_raw\":\"" + dataRaw + "\",";
+  json += "\"balance_type\":\"" + String(cfg.balanceType == 0 ? "AandD" : "Sartorius") + "\"";
+  json += "}";
+  
+  wsClient.sendTXT(json);
+  Serial.printf("[WS→Tab5] %s\n", json.c_str());
+}
+
+// ===== Wi-Fi / NTP =====
+void startAP() {
+  currentAPSSID = "Easylogger-" + macSuffix();
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(currentAPSSID.c_str(), "easylogger");
+  IPAddress apIP = WiFi.softAPIP();
+  uint8_t mac[6]; WiFi.softAPmacAddress(mac);
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  Serial.printf("[AP] SSID: %s  PASS: easylogger  IP: %s  MAC: %s\n",
+                currentAPSSID.c_str(), apIP.toString().c_str(), macStr);
+  dnsServer.start(DNS_PORT, "*", apIP);
+  dnsRunning = true;
+}
+
+bool startClientWiFi() {
+  // NOUVEAU: Si autoConnectStamPLC est activé, utiliser le réseau StamPLC
+  const char* ssidToUse = cfg.ssid;
+  const char* passToUse = cfg.pass;
+  bool useStamPLC = false;
+  
+  if (cfg.autoConnectStamPLC && strlen(cfg.stamplc_ssid) > 0) {
+    ssidToUse = cfg.stamplc_ssid;
+    passToUse = cfg.stamplc_pass;
+    useStamPLC = true;
+    Serial.println("[WiFi] Mode auto-connexion StamPLC activé");
+  } else if (!cfg.client_enabled || strlen(cfg.ssid)==0) {
+    return false;
+  }
+
+  WiFi.mode(WIFI_STA);
+
+  hostName = "easylogger-" + macSuffix();
+  WiFi.setHostname(hostName.c_str());
+
+  if (!cfg.ip_dhcp) {
+    IPAddress ip   = ipFrom(cfg.ip);
+    IPAddress mask = ipFrom(cfg.mask);
+    IPAddress gw   = ipFrom(cfg.gw);
+    IPAddress dns1 = ipFrom(cfg.dns);
+    if (ip && mask && gw) {
+      WiFi.config(ip, gw, mask, dns1);
+      Serial.printf("[IP] Statique %s / %s / %s  DNS:%s\n",
+        ip.toString().c_str(), mask.toString().c_str(), gw.toString().c_str(), dns1.toString().c_str());
+    } else {
+      Serial.println("[IP] Paramètres statiques invalides, bascule en DHCP");
+      cfg.ip_dhcp = true;
+    }
+  } else {
+    Serial.println("[IP] DHCP");
+  }
+
+  WiFi.begin(ssidToUse, passToUse);
+  Serial.printf("[Client Wi-Fi] Connexion SSID='%s'...\n", ssidToUse);
+  uint32_t t0 = millis();
+  while (WiFi.status()!=WL_CONNECTED && millis()-t0<15000) delay(100);
+  wifiOK = (WiFi.status()==WL_CONNECTED);
+  if (wifiOK) {
+    uint8_t mac[6]; WiFi.macAddress(mac);
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    Serial.printf("[Client Wi-Fi] OK. IP: %s  RSSI: %d dBm  MAC: %s  Host: %s.local\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI(), macStr, hostName.c_str());
+
+    if (MDNS.begin(hostName.c_str())) {
+      MDNS.addService("http", "tcp", 80);
+      Serial.printf("[mDNS] http://%s.local\n", hostName.c_str());
+    } else {
+      Serial.println("[mDNS] Echec MDNS.begin()");
+    }
+
+    setenv("TZ", TZ_EUROPE_PARIS, 1); tzset();
+    configTzTime(TZ_EUROPE_PARIS, "pool.ntp.org", "time.google.com");
+    for (int i=0;i<50;++i){ if(time(nullptr)>1700000000){ timeReady=true; break; } delay(100); }
+    Serial.printf("[NTP] timeReady=%s\n", timeReady?"true":"false");
+
+    uiMode = UiMode::SplashStaInfo;
+    modeEnteredAt = millis();
+    return true;
+  }
+  Serial.println("[Client Wi-Fi] Echec connexion.");
+  return false;
+}
+
+// ===== Interface Web (ajout config Datalogger) =====
+const char PAGE_INDEX[] PROGMEM = R"HTML(
+<!doctype html><html lang="fr"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Easylogger Setup</title>
+<style>
+:root{--bg:#0a0a0a;--card:#111;--muted:#888;--text:#f2f2f2;--brand:#2f7dff;--danger:#e5484d;--line:#222;
+--radius:14px;--pad:14px;--max:980px;--shadow:0 6px 30px rgba(0,0,0,.35);--fs-h1:clamp(18px,2.5vw,22px);--fs:16px;--fs-small:14px}
+*{box-sizing:border-box}html,body{margin:0;padding:0;background:linear-gradient(180deg,#0b1020,#0a0a0a);color:var(--text);font:400 var(--fs)/1.45 system-ui,Segoe UI,Roboto,Arial}
+.container{max-width:var(--max);margin:0 auto;padding:calc(var(--pad)*1.2) clamp(10px,3vw,24px)}
+.header{display:flex;align-items:center;gap:12px;margin-bottom:16px}
+.brand{width:38px;height:38px;border-radius:10px;background:radial-gradient(120% 120% at 30% 20%,#5aa0ff,#2f7dff 60%,#1a49a8);box-shadow:var(--shadow)}
+h1{margin:0;font-size:var(--fs-h1)}.badge{display:inline-block;margin-left:8px;padding:4px 10px;border-radius:999px;background:#1a1f2b;color:#b8c8ff;border:1px solid #2a3350}
+.grid{display:grid;gap:14px}@media (min-width:900px){.grid-2{grid-template-columns:1fr 1fr}}
+.card{background:var(--card);border:1px solid #2a3350;border-radius:var(--radius);box-shadow:var(--shadow);padding:var(--pad)}
+.card h2{margin:0 0 10px;font-size:18px}label{display:block;font-size:var(--fs-small);color:#cbd3ff;margin-bottom:6px}
+input[type=text],input[type=password],input[type=number],select{width:100%;padding:12px 14px;border:1px solid #2a3350;border-radius:10px;background:#0b0f1a;color:#fff;outline:none}
+input::placeholder{color:#6e7bb3}.row{display:grid;gap:12px}@media (min-width:560px){.row-2{grid-template-columns:1fr 1fr}}
+.check{display:flex;align-items:center;gap:10px;font-size:var(--fs)}.actions{display:flex;gap:12px;flex-wrap:wrap;margin-top:10px}
+.btn{appearance:none;border:0;border-radius:12px;padding:12px 16px;font-weight:600;cursor:pointer;color:white;background:var(--brand);box-shadow:var(--shadow)}
+.btn.small{padding:10px 12px;font-size:14px}.btn.block{width:100%}.btn.red{background:var(--danger)}
+.meta{font-size:var(--fs-small);color:#9aa7d1;margin-top:8px}.kv{display:grid;grid-template-columns:160px 1fr;gap:8px;font-size:var(--fs-small)}
+hr{border:0;border-top:1px solid #2a3350;margin:12px 0}.footer{margin-top:22px;text-align:center;color:#9aa7d1;font-size:var(--fs-small)}
+.alert{padding:12px;border-radius:8px;background:#1a3a1a;border:1px solid #2a5030;color:#7fc77f;margin-bottom:12px}
+</style></head><body>
+<div class="container">
+  <div class="header"><div class="brand"></div><h1>Easylogger <span class="badge">%TITLE%</span></h1></div>
+
+  <form method="POST" action="/save" class="grid grid-2">
+  
+    <!-- NOUVEAU: Mode Datalogger -->
+    <div class="card">
+      <h2>🔗 Mode Datalogger</h2>
+      <label>Mode de fonctionnement</label>
+      <select name="devmode" id="devmode">
+        <option value="0" %MODE0%>Standalone (local uniquement)</option>
+        <option value="1" %MODE1%>Datalogger (avec Tab5)</option>
+      </select>
+      
+      <div id="datalogger_config" style="display:none">
+        <div class="alert">
+          ⚠️ En mode Datalogger, l'AtomS3 se connecte automatiquement au Tab5 et lui envoie les données via WebSocket.
+        </div>
+        
+        <label>ID de l'appareil</label>
+        <input name="device_id" value="%DEVICE_ID%" placeholder="ATOMS3_001" maxlength="16">
+        
+        <label>SSID du Tab5</label>
+        <input name="tab5_ssid" value="%TAB5_SSID%" placeholder="Datalogger-XXXX" maxlength="32">
+        
+        <label>Mot de passe Tab5</label>
+        <input name="tab5_pass" type="password" value="%TAB5_PASS%" placeholder="datalogger" maxlength="64">
+        
+        <label>IP du Tab5 (défaut: 192.168.4.1)</label>
+        <input name="tab5_ip" value="%TAB5_IP%" placeholder="192.168.4.1" maxlength="15">
+        
+        <div class="meta">
+          L'AtomS3 continuera d'afficher les données localement même en mode Datalogger.
+        </div>
+      </div>
+    </div>
+  
+    <div class="card">
+      <h2>Connexion Wi-Fi (Client)</h2>
+      <label class="check"><input type="checkbox" name="autostamplc" id="autostamplc" %AUTOSTAMPLC_CHECK%> Connexion automatique au réseau <b>StamPLC</b></label>
+      <div class="meta">ℹ️ Si activé, l'AtomS3 se connectera automatiquement au même réseau que le StamPLC</div>
+      
+      <div id="stamplc_config" style="display:none;margin-top:1rem;">
+        <div class="row">
+          <div><label>SSID du réseau StamPLC</label><input name="stamplc_ssid" type="text" value="%STAMPLC_SSID%" placeholder="Wifi Unifi" maxlength="32"></div>
+          <div><label>Mot de passe</label><input name="stamplc_pass" type="password" value="%STAMPLC_PASS%" placeholder="Mot de passe" maxlength="64"></div>
+        </div>
+      </div>
+      
+      <hr style="margin:1rem 0;">
+      
+      <label class="check"><input type="checkbox" name="cli" %CLI_CHECK%> Activer le mode <b>Client Wi-Fi</b> (réseau personnalisé)</label>
+      <div class="meta">ℹ️ Utilisé uniquement si la connexion automatique StamPLC est désactivée. En mode Datalogger, cette section n'est pas utilisée.</div>
+
+      <div class="row">
+        <div><label>SSID</label><input id="ssid" name="ssid" type="text" value="%SSID%" placeholder="Nom du réseau"></div>
+        <div><label>Mot de passe</label><input id="pass" name="pass" type="password" value="%PASS%" placeholder="Mot de passe"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Réglages Easylogger</h2>
+      <div class="grid grid-2">
+        <div><label>Titre</label><input name="title" type="text" value="%TITLE%" maxlength="16"></div>
+        <div><label>Texte d'attente</label><input name="idle" type="text" value="%IDLE%" maxlength="16"></div>
+        <div><label>Taille police (1..3)</label><input name="font" type="number" min="1" max="3" value="%FONT%"></div>
+        <div><label>Durée affichage (ms)</label><input name="showms" type="number" min="300" max="10000" value="%SHOWMS%"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Configuration Balance</h2>
+      <div class="grid grid-2">
+        <div>
+          <label>Type de balance</label>
+          <select name="btype" id="btype" onchange="updateBalanceParams()">
+            <option value="0" %BTYPE0%>A&amp;D</option>
+            <option value="1" %BTYPE1%>Sartorius</option>
+          </select>
+        </div>
+        <div>
+          <label>Vitesse (baud)</label>
+          <select name="bbaud" id="bbaud">
+            <option value="2400" %BBAUD2400%>2400</option>
+            <option value="4800" %BBAUD4800%>4800</option>
+            <option value="9600" %BBAUD9600%>9600</option>
+            <option value="19200" %BBAUD19200%>19200</option>
+          </select>
+        </div>
+        <div>
+          <label>Bits de données</label>
+          <select name="dbits" id="dbits">
+            <option value="5" %DBITS5%>5</option>
+            <option value="6" %DBITS6%>6</option>
+            <option value="7" %DBITS7%>7</option>
+            <option value="8" %DBITS8%>8</option>
+          </select>
+        </div>
+        <div>
+          <label>Parité</label>
+          <select name="parity" id="parity">
+            <option value="0" %PARITY0%>Aucune (N)</option>
+            <option value="1" %PARITY1%>Paire (E)</option>
+            <option value="2" %PARITY2%>Impaire (O)</option>
+          </select>
+        </div>
+        <div>
+          <label>Bits d'arrêt</label>
+          <select name="stopbits" id="stopbits">
+            <option value="1" %STOPBITS1%>1</option>
+            <option value="2" %STOPBITS2%>2</option>
+          </select>
+        </div>
+        <div>
+          <label>Contrôle de flux</label>
+          <select name="handshake" id="handshake">
+            <option value="0" %HANDSHAKE0%>Aucun</option>
+            <option value="1" %HANDSHAKE1%>RTS/CTS</option>
+            <option value="2" %HANDSHAKE2%>XON/XOFF</option>
+          </select>
+        </div>
+        <div>
+          <label>Terminateur</label>
+          <select name="terminator" id="terminator">
+            <option value="CRLF" %TERM_CRLF%>CRLF (\r\n)</option>
+            <option value="CR" %TERM_CR%>CR (\r)</option>
+            <option value="LF" %TERM_LF%>LF (\n)</option>
+            <option value="NONE" %TERM_NONE%>Aucun</option>
+          </select>
+        </div>
+        <div>
+          <label>Échange RX/TX</label>
+          <label class="check"><input type="checkbox" name="swaprt" %SWAPRT%> Inverser RX et TX</label>
+        </div>
+      </div>
+      <div class="actions"><button class="btn" type="submit">💾 Enregistrer & redémarrer</button></div>
+    </div>
+
+  </form>
+
+  <div class="footer">Easylogger + Datalogger Mode v2.0</div>
+</div>
+
+<script>
+const devmode = document.getElementById('devmode');
+const dlConfig = document.getElementById('datalogger_config');
+const btype = document.getElementById('btype');
+
+function updateDataloggerVis() {
+  if (devmode.value === '1') {
+    dlConfig.style.display = 'block';
+  } else {
+    dlConfig.style.display = 'none';
+  }
+}
+
+function updateBalanceParams() {
+  // Mettre à jour les valeurs par défaut selon le type de balance
+  if (btype.value === '0') {
+    // A&D: 2400, 7E1, pas de contrôle de flux, CRLF
+    document.getElementById('bbaud').value = '2400';
+    document.getElementById('dbits').value = '7';
+    document.getElementById('parity').value = '1';
+    document.getElementById('stopbits').value = '1';
+    document.getElementById('handshake').value = '0';
+    document.getElementById('terminator').value = 'CRLF';
+  } else {
+    // Sartorius: 9600 par défaut
+    document.getElementById('bbaud').value = '9600';
+  }
+}
+
+const autostamplc = document.getElementById('autostamplc');
+const stamplcConfig = document.getElementById('stamplc_config');
+
+function updateStamPLCVis() {
+  if (autostamplc && autostamplc.checked) {
+    if (stamplcConfig) stamplcConfig.style.display = 'block';
+  } else {
+    if (stamplcConfig) stamplcConfig.style.display = 'none';
+  }
+}
+
+devmode.addEventListener('change', updateDataloggerVis);
+btype.addEventListener('change', updateBalanceParams);
+if (autostamplc) autostamplc.addEventListener('change', updateStamPLCVis);
+updateDataloggerVis();
+if (autostamplc) updateStamPLCVis();
+</script>
+</body></html>
+)HTML";
+
+String htmlIndex() {
+  auto ipcur = (WiFi.getMode()==WIFI_AP) ? WiFi.softAPIP() : WiFi.localIP();
+  String h = PAGE_INDEX;
+  h.replace("%TITLE%", cfg.title);
+  
+  // Datalogger
+  h.replace("%MODE0%", (cfg.deviceMode==0)?"selected":"");
+  h.replace("%MODE1%", (cfg.deviceMode==1)?"selected":"");
+  h.replace("%DEVICE_ID%", cfg.device_id);
+  h.replace("%TAB5_SSID%", cfg.tab5_ssid);
+  h.replace("%TAB5_PASS%", cfg.tab5_pass);
+  h.replace("%TAB5_IP%", cfg.tab5_ip);
+  
+  // WiFi - Connexion automatique StamPLC
+  h.replace("%AUTOSTAMPLC_CHECK%", cfg.autoConnectStamPLC ? "checked" : "");
+  h.replace("%STAMPLC_SSID%", cfg.stamplc_ssid);
+  h.replace("%STAMPLC_PASS%", cfg.stamplc_pass);
+  
+  // WiFi - Client personnalisé
+  h.replace("%CLI_CHECK%", cfg.client_enabled ? "checked" : "");
+  h.replace("%SSID%", cfg.ssid);
+  h.replace("%PASS%", cfg.pass);
+  
+  // UI
+  h.replace("%IDLE%", cfg.idleText);
+  h.replace("%FONT%", String(cfg.fontMain));
+  h.replace("%SHOWMS%", String(cfg.showWeightMs));
+  
+  // Balance
+  h.replace("%BTYPE0%", (cfg.balanceType==0)?"selected":"");
+  h.replace("%BTYPE1%", (cfg.balanceType==1)?"selected":"");
+  h.replace("%BBAUD2400%", (cfg.balanceBaud==2400)?"selected":"");
+  h.replace("%BBAUD4800%", (cfg.balanceBaud==4800)?"selected":"");
+  h.replace("%BBAUD9600%", (cfg.balanceBaud==9600)?"selected":"");
+  h.replace("%BBAUD19200%", (cfg.balanceBaud==19200)?"selected":"");
+  
+  h.replace("%DBITS5%", (cfg.dataBits==5)?"selected":"");
+  h.replace("%DBITS6%", (cfg.dataBits==6)?"selected":"");
+  h.replace("%DBITS7%", (cfg.dataBits==7)?"selected":"");
+  h.replace("%DBITS8%", (cfg.dataBits==8)?"selected":"");
+  
+  h.replace("%PARITY0%", (cfg.parity==0)?"selected":"");
+  h.replace("%PARITY1%", (cfg.parity==1)?"selected":"");
+  h.replace("%PARITY2%", (cfg.parity==2)?"selected":"");
+  
+  h.replace("%STOPBITS1%", (cfg.stopBits==1)?"selected":"");
+  h.replace("%STOPBITS2%", (cfg.stopBits==2)?"selected":"");
+  
+  h.replace("%HANDSHAKE0%", (cfg.handshake==0)?"selected":"");
+  h.replace("%HANDSHAKE1%", (cfg.handshake==1)?"selected":"");
+  h.replace("%HANDSHAKE2%", (cfg.handshake==2)?"selected":"");
+  
+  String term = String(cfg.terminator);
+  h.replace("%TERM_CRLF%", (term=="\r\n")?"selected":"");
+  h.replace("%TERM_CR%", (term=="\r")?"selected":"");
+  h.replace("%TERM_LF%", (term=="\n")?"selected":"");
+  h.replace("%TERM_NONE%", (term.length()==0)?"selected":"");
+  
+  h.replace("%SWAPRT%", cfg.swapRxTx ? "checked" : "");
+  
+  return h;
+}
+
+// ===== HTTP Handlers =====
+void sendCORS() {
+  server.sendHeader("Access-Control-Allow-Origin","*");
+  server.sendHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers","Content-Type");
+}
+
+void handleRoot() {
+  sendCORS();
+  server.send(200, "text/html", htmlIndex());
+}
+
+void handleSave() {
+  // Datalogger
+  cfg.deviceMode = (uint8_t)constrain(server.arg("devmode").toInt(), 0, 1);
+  String s;
+  s = server.arg("device_id"); s.toCharArray(cfg.device_id, sizeof(cfg.device_id));
+  s = server.arg("tab5_ssid"); s.toCharArray(cfg.tab5_ssid, sizeof(cfg.tab5_ssid));
+  s = server.arg("tab5_pass"); s.toCharArray(cfg.tab5_pass, sizeof(cfg.tab5_pass));
+  s = server.arg("tab5_ip"); s.toCharArray(cfg.tab5_ip, sizeof(cfg.tab5_ip));
+  
+  // WiFi - Connexion automatique StamPLC
+  cfg.autoConnectStamPLC = server.hasArg("autostamplc");
+  s = server.arg("stamplc_ssid"); s.toCharArray(cfg.stamplc_ssid, sizeof(cfg.stamplc_ssid));
+  s = server.arg("stamplc_pass"); s.toCharArray(cfg.stamplc_pass, sizeof(cfg.stamplc_pass));
+  
+  // WiFi - Client personnalisé
+  cfg.client_enabled = server.hasArg("cli");
+  s = server.arg("ssid"); s.toCharArray(cfg.ssid, sizeof(cfg.ssid));
+  s = server.arg("pass"); s.toCharArray(cfg.pass, sizeof(cfg.pass));
+  
+  // UI
+  s = server.arg("title"); s.toCharArray(cfg.title, sizeof(cfg.title));
+  s = server.arg("idle"); s.toCharArray(cfg.idleText, sizeof(cfg.idleText));
+  cfg.fontMain = (uint8_t)constrain(server.arg("font").toInt(), 1, 3);
+  cfg.showWeightMs = (uint32_t)constrain(server.arg("showms").toInt(), 300, 10000);
+  
+  // Balance
+  cfg.balanceType = (uint8_t)constrain(server.arg("btype").toInt(), 0, 1);
+  int baud = server.arg("bbaud").toInt();
+  if (baud == 2400 || baud == 4800 || baud == 9600 || baud == 19200) {
+    cfg.balanceBaud = (uint32_t)baud;
+  }
+  
+  cfg.dataBits = (uint8_t)constrain(server.arg("dbits").toInt(), 5, 8);
+  cfg.parity = (uint8_t)constrain(server.arg("parity").toInt(), 0, 2);
+  cfg.stopBits = (uint8_t)constrain(server.arg("stopbits").toInt(), 1, 2);
+  cfg.handshake = (uint8_t)constrain(server.arg("handshake").toInt(), 0, 2);
+  cfg.swapRxTx = server.hasArg("swaprt");
+  
+  s = server.arg("terminator");
+  // Convertir les codes en caractères réels
+  if (s == "CRLF") {
+    strcpy(cfg.terminator, "\r\n");
+  } else if (s == "CR") {
+    strcpy(cfg.terminator, "\r");
+  } else if (s == "LF") {
+    strcpy(cfg.terminator, "\n");
+  } else if (s == "NONE" || s.length() == 0) {
+    cfg.terminator[0] = '\0';
+  } else {
+    // Valeur personnalisée (fallback)
+    s.toCharArray(cfg.terminator, sizeof(cfg.terminator));
+  }
+  
+  saveConfig();
+  server.send(200, "text/plain", "Config enregistrée. Redémarrage...");
+  delay(400); ESP.restart();
+}
+
+void handleFactory() {
+  prefs.begin("easylog"); prefs.clear(); prefs.end();
+  server.send(200, "text/plain", "Configuration effacée. Redémarrage...");
+  delay(400); ESP.restart();
+}
+
+void handleStatus() {
+  sendCORS();
+  String json = "{";
+  json += "\"lastWeight\":\"" + lastWeight + "\",";
+  json += "\"now\":\"" + nowDateTime() + "\",";
+  json += "\"balanceType\":\"" + String(cfg.balanceType == 0 ? "AandD" : "Sartorius") + "\",";
+  json += "\"baudRate\":" + String(cfg.balanceBaud);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void setupWeb() {
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/save", HTTP_POST, handleSave);
+  server.on("/factory", HTTP_POST, handleFactory);
+  server.on("/api/status", HTTP_GET, handleStatus);  // NOUVEAU: Endpoint pour StamPLC
+  server.begin();
+}
+
+// ===== Dessin écran (simplifié) =====
+void drawWifiIndicator() {
+  if (!cfg.showWifiIndicator) return;
+  auto& d = AtomS3.Display;
+  uint16_t color = RED;
+  String label = "WiFi";
+  
+  if (cfg.deviceMode == (uint8_t)DeviceMode::Datalogger) {
+    // Mode Datalogger : afficher l'état de connexion Tab5
+    if (wsConnected && wifiConnectedToTab5) {
+      color = GREEN;  // Connecté au Tab5
+      label = "Tab5";
+    } else if (wifiConnectedToTab5) {
+      color = YELLOW;  // WiFi OK mais WebSocket non connecté
+      label = "WiFi";
+    } else {
+      color = RED;  // Non connecté
+      label = "Recherche";
+    }
+  } else {
+    // Mode Standalone : comportement original
+    if (wifiOK && timeReady) color = GREEN;
+    else if (wifiOK) color = YELLOW;
+  }
+  
+  int yPos = d.height() - 8;
+  d.fillRoundRect(2, yPos, 8, 8, 2, color);
+  d.setTextColor(WHITE);
+  d.setTextDatum(top_left);
+  d.setTextSize(1);
+  d.drawString(label, 12, yPos);
+}
+
+void drawHeader() {
+  auto& d = AtomS3.Display;
+  d.setTextDatum(top_center);
+  d.setTextColor(WHITE);
+  d.setTextSize(1);
+  d.drawString(cfg.title, d.width()/2, 4);
+  d.drawLine(4, 18, d.width()-4, 18, WHITE);
+}
+
+void drawMainCentered(const String& text, uint16_t color) {
+  auto& d = AtomS3.Display;
+  d.setTextDatum(middle_center);
+  d.setTextColor(color);
+  d.setTextSize(cfg.fontMain);
+  d.drawString(text, d.width()/2, d.height()/2 - 2);
+}
+
+void drawDateTime() {
+  auto& d = AtomS3.Display;
+  int yStart = 90;
+  int yHeight = d.height() - yStart - 10;
+  d.fillRect(0, yStart, d.width(), yHeight, BLACK);
+  d.setTextColor(CYAN);
+  d.setTextDatum(middle_center);
+  d.setTextSize(1);
+  d.drawString(nowDateTime(), d.width()/2, yStart + yHeight/2);
+}
+
+void drawIdleScreen() {
+  auto& d = AtomS3.Display;
+  d.clear();
+  drawHeader();
+  
+  // En mode Datalogger, afficher l'état de connexion
+  if (cfg.deviceMode == (uint8_t)DeviceMode::Datalogger) {
+    if (!wifiConnectedToTab5) {
+      // Afficher "Recherche Tab5..."
+      drawMainCentered("Recherche Tab5...", YELLOW);
+    } else if (!wsConnected) {
+      // WiFi connecté mais WebSocket non connecté
+      drawMainCentered("Connexion Tab5...", YELLOW);
+    } else {
+      // Connecté, afficher le texte d'attente normal
+      drawMainCentered(cfg.idleText, COL_GRAY);
+    }
+  } else {
+    // Mode Standalone : comportement normal
+    drawMainCentered(cfg.idleText, COL_GRAY);
+  }
+  
+  drawDateTime();
+  drawWifiIndicator();
+}
+
+void drawWeightScreen(const String& raw) {
+  auto& d = AtomS3.Display;
+  d.clear();
+  drawHeader();
+  drawMainCentered(raw, WHITE);
+  drawDateTime();
+  drawWifiIndicator();
+}
+
+String parseBalanceResponse(const String& raw) {
+  String cleaned = raw;
+  cleaned.replace("\r", "");
+  cleaned.replace("\n", "");
+  cleaned.trim();
+  
+  if (cfg.balanceType == (uint8_t)BalanceType::Sartorius && cleaned.length() > 0) {
+    String result = "";
+    for (size_t i = 0; i < cleaned.length(); i++) {
+      char c = cleaned.charAt(i);
+      if (isprint(c) || c == ' ') {
+        result += c;
+      }
+    }
+    result.trim();
+    return result.length() > 0 ? result : cleaned;
+  }
+  
+  return cleaned;
+}
+
+// ===== Setup =====
+void setup() {
+  Serial.begin(115200);
+  auto m5cfg = M5.config();
+  AtomS3.begin(m5cfg);
+  AtomS3.Display.setRotation(0);
+
+  loadConfig();
+
+  Serial.printf("\n\n=== Easylogger v2.0 ===\n");
+  Serial.printf("Mode: %s\n", (cfg.deviceMode == (uint8_t)DeviceMode::Datalogger) ? "Datalogger" : "Standalone");
+  Serial.printf("Auto-connexion StamPLC: %s\n", cfg.autoConnectStamPLC ? "OUI" : "NON");
+  
+  if (cfg.deviceMode == (uint8_t)DeviceMode::Datalogger) {
+    // Mode Datalogger: connexion au Tab5
+    Serial.printf("Device ID: %s\n", cfg.device_id);
+    bool connectedToTab5 = connectToTab5();
+    if (!connectedToTab5) {
+      // Si la connexion Tab5 échoue, essayer le réseau StamPLC si activé
+      if (cfg.autoConnectStamPLC && strlen(cfg.stamplc_ssid) > 0) {
+        Serial.println("[WiFi] Tentative de connexion au réseau StamPLC...");
+        bool sta = startClientWiFi();
+        if (!sta) {
+          Serial.println("[Datalogger] Echec connexion StamPLC, démarrage mode AP pour configuration");
+          startAP();
+        }
+      } else {
+        Serial.println("[Datalogger] Echec connexion Tab5, démarrage mode AP pour configuration");
+        startAP();  // Démarrer l'AP si la connexion Tab5 échoue
+      }
+    }
+  } else {
+    // Mode Standalone: essayer WiFi client (StamPLC auto ou personnalisé), sinon AP
+    bool sta = startClientWiFi();
+    if (!sta) startAP();  // Toujours démarrer l'AP en mode Standalone si pas de WiFi client
+  }
+
+  setupWeb();
+
+  uint32_t baud = getBalanceBaud();
+  int serialConfig = getBalanceSerialConfig();
+  int rxPin = getBalanceRxPin();
+  int txPin = getBalanceTxPin();
+  Serial2.begin(baud, serialConfig, rxPin, txPin);
+  
+  char parityChar = (cfg.parity == 1) ? 'E' : ((cfg.parity == 2) ? 'O' : 'N');
+  char configStr[8];
+  snprintf(configStr, sizeof(configStr), "%d%c%d", cfg.dataBits, parityChar, cfg.stopBits);
+  
+  Serial.printf("[Balance] Type: %s, Baud: %lu, Config: %s, RX: %d, TX: %d\n",
+                (cfg.balanceType == (uint8_t)BalanceType::AandD ? "A&D" : "Sartorius"),
+                baud, configStr, rxPin, txPin);
+
+  drawIdleScreen();
+  Serial.println("[READY]");
+}
+
+// ===== Loop =====
+void loop() {
+  AtomS3.update();
+  server.handleClient();
+  if (dnsRunning) dnsServer.processNextRequest();
+  
+  // NOUVEAU: WebSocket loop et reconnexion automatique
+  if (cfg.deviceMode == (uint8_t)DeviceMode::Datalogger) {
+    // Vérifier l'état de la connexion WiFi
+    bool wifiCurrentlyConnected = (WiFi.status() == WL_CONNECTED);
+    
+    // Si le WiFi n'est pas connecté, réessayer périodiquement
+    if (!wifiCurrentlyConnected) {
+      if (millis() - lastWiFiReconnectAttempt > WIFI_RECONNECT_INTERVAL) {
+        lastWiFiReconnectAttempt = millis();
+        Serial.println("[Datalogger] Tentative reconnexion WiFi...");
+        wifiConnectedToTab5 = false;
+        wsConnected = false;
+        
+        // Réessayer de se connecter
+        connectToTab5();
+      }
+    } else {
+      // WiFi connecté, mettre à jour l'état
+      if (!wifiConnectedToTab5) {
+        wifiConnectedToTab5 = true;
+        // Réinitialiser le WebSocket si nécessaire
+        if (!wsClient.isConnected()) {
+          String wsUrl = String(cfg.tab5_ip);
+          wsClient.begin(wsUrl, 81, "/");
+          wsClient.onEvent(wsClientEvent);
+          wsClient.setReconnectInterval(5000);
+        }
+      }
+    }
+    
+    // Gérer le WebSocket
+    if (wifiConnectedToTab5) {
+      wsClient.loop();
+      
+      // Tentative de reconnexion WebSocket si déconnecté
+      if (!wsConnected && millis() - lastWsReconnectAttempt > WS_RECONNECT_INTERVAL) {
+        lastWsReconnectAttempt = millis();
+        Serial.println("[WS] Tentative reconnexion WebSocket...");
+        // La reconnexion est gérée automatiquement par la bibliothèque
+      }
+    }
+  }
+  
+  // Bouton - Détection appui long (8 secondes) pour reset usine
+  if (AtomS3.BtnA.isPressed()) {
+    if (!btnPressed) {
+      // Début de l'appui
+      btnPressed = true;
+      btnPressStart = millis();
+      Serial.println("[BTN] Appui détecté...");
+    } else {
+      // Appui en cours - vérifier si on atteint 8 secondes
+      uint32_t pressDuration = millis() - btnPressStart;
+      if (pressDuration >= LONG_PRESS_MS) {
+        Serial.println("[BTN] Appui long détecté (8s) - Reset usine");
+        btnPressed = false;
+        // Réinitialiser aux paramètres d'usine
+        prefs.begin("easylog");
+        prefs.clear();
+        prefs.end();
+        // Afficher message sur l'écran
+        auto& d = AtomS3.Display;
+        d.clear();
+        d.setTextDatum(middle_center);
+        d.setTextColor(RED);
+        d.setTextSize(1);
+        d.drawString("RESET USINE", d.width()/2, d.height()/2 - 10);
+        d.drawString("Redemarrage...", d.width()/2, d.height()/2 + 10);
+        delay(1000);
+        ESP.restart();
+      }
+    }
+  } else {
+    // Bouton relâché
+    if (btnPressed) {
+      uint32_t pressDuration = millis() - btnPressStart;
+      if (pressDuration < LONG_PRESS_MS) {
+        // Appui court - commande balance normale
+        String cmd = getBalanceCommand();
+        Serial2.write((const uint8_t*)cmd.c_str(), cmd.length());
+        Serial.print("[TX] "); Serial.print(cmd);
+      }
+      btnPressed = false;
+    }
+  }
+
+  // Réception balance
+  bool gotLine = false;
+  while (Serial2.available() > 0) {
+    char c = (char)Serial2.read();
+    if (c == '\n') {
+      if (lineLen > 0) {
+        lineBuf[lineLen] = '\0';
+        String s = String(lineBuf);
+        s.replace("\r", "");
+        s.replace("\n", "");
+        s.trim();
+        
+        if (s.length() > 0) {
+          String cleaned = parseBalanceResponse(s);
+          
+          Serial.print("[RX] raw: '"); 
+          for (size_t i = 0; i < String(lineBuf).length(); i++) {
+            char ch = lineBuf[i];
+            if (isprint(ch)) Serial.print(ch);
+            else Serial.printf("[%02X]", (unsigned char)ch);
+          }
+          Serial.print("' -> cleaned: '");
+          Serial.print(cleaned);
+          Serial.println("'");
+          
+          lastWeight = cleaned;
+          lastWeightMs = millis();
+          
+          // NOUVEAU: Envoi au Tab5 si mode Datalogger
+          if (cfg.deviceMode == (uint8_t)DeviceMode::Datalogger) {
+            sendToTab5(cleaned);
+          }
+          
+          drawWeightScreen(lastWeight);
+          uiMode = UiMode::ShowWeight;
+          modeEnteredAt = millis();
+          gotLine = true;
+        }
+        lineLen = 0;
+      }
+    } else if (c == '\r' || (c >= 32 && c <= 126)) {
+      if (lineLen < sizeof(lineBuf) - 1) {
+        lineBuf[lineLen++] = c;
+      } else {
+        lineLen = 0;
+      }
+    } else {
+      if (cfg.balanceType == (uint8_t)BalanceType::Sartorius && lineLen < sizeof(lineBuf) - 1) {
+        lineBuf[lineLen++] = c;
+      }
+    }
+    lastByteMs = millis();
+  }
+  
+  // Timeout
+  if (lineLen > 0 && (millis() - lastByteMs >= LINE_TIMEOUT_MS)) {
+    lineBuf[lineLen] = '\0';
+    String s = String(lineBuf);
+    s.replace("\r", "");
+    s.replace("\n", "");
+    s.trim();
+    if (s.length() > 0) {
+      String cleaned = parseBalanceResponse(s);
+      lastWeight = cleaned;
+      lastWeightMs = millis();
+      
+      // NOUVEAU: Envoi au Tab5
+      if (cfg.deviceMode == (uint8_t)DeviceMode::Datalogger) {
+        sendToTab5(cleaned);
+      }
+      
+      drawWeightScreen(lastWeight);
+      uiMode = UiMode::ShowWeight;
+      modeEnteredAt = millis();
+    }
+    lineLen = 0;
+  }
+
+  // Rafraîchissement UI
+  if (uiMode == UiMode::ShowWeight) {
+    if (millis()-modeEnteredAt >= cfg.showWeightMs) {
+      uiMode = UiMode::IdleClock; modeEnteredAt = millis(); drawIdleScreen();
+    }
+  } else if (uiMode == UiMode::IdleClock) {
+    static uint32_t lastIdle = 0;
+    static bool lastWifiState = false;
+    static bool lastWsState = false;
+    
+    // Forcer un redraw si l'état de connexion change (en mode Datalogger)
+    bool needsRedraw = false;
+    if (cfg.deviceMode == (uint8_t)DeviceMode::Datalogger) {
+      if (wifiConnectedToTab5 != lastWifiState || wsConnected != lastWsState) {
+        needsRedraw = true;
+        lastWifiState = wifiConnectedToTab5;
+        lastWsState = wsConnected;
+      }
+    }
+    
+    if (needsRedraw || millis()-lastIdle >= IDLE_REFRESH_MS) {
+      lastIdle = millis();
+      drawIdleScreen();
+    }
+  }
+}
+
+
+

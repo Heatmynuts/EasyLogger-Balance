@@ -1,0 +1,821 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <title>StamPLC Complete</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    :root {
+      --bg-primary:#f5f1e8; --bg-secondary:#ffffff; --bg-card:#fefdfb;
+      --accent-gold:#f4d03f; --accent-dark:#2d2d2d;
+      --text-primary:#1a1a1a; --text-secondary:#6b6b6b;
+      --border-light:#e8e4d9;
+      --shadow:0 10px 40px rgba(0,0,0,0.08);
+      --shadow-hover:0 20px 60px rgba(0,0,0,0.12);
+    }
+    body {
+      font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+      background:var(--bg-primary); color:var(--text-primary); overflow-x:hidden;
+    }
+    header {
+      background:var(--bg-secondary); padding:1.5rem 2rem;
+      box-shadow:0 4px 20px rgba(0,0,0,0.05);
+      position:sticky; top:0; z-index:100;
+    }
+    .header-top {
+      display:flex; justify-content:space-between; align-items:center;
+      flex-wrap:wrap; gap:1rem; margin-bottom:1rem;
+    }
+    .logo { font-size:1.5rem; font-weight:700; display:flex; align-items:center; gap:.5rem; }
+    .logo-icon {
+      width:40px; height:40px; background:var(--accent-dark); border-radius:12px;
+      display:flex; align-items:center; justify-content:center;
+      color:var(--accent-gold); font-weight:900;
+    }
+    .header-right { display:flex; align-items:center; gap:1.5rem; }
+    .ip-badge {
+      background:var(--bg-primary); padding:.5rem 1rem; border-radius:999px;
+      font-size:.85rem; color:var(--text-secondary); border:1px solid var(--border-light);
+    }
+    .status-dot {
+      width:10px; height:10px; border-radius:50%; margin-left:8px;
+      display:inline-block; background:#4ade80;
+    }
+    .lang-switch {
+      background:var(--accent-dark); color:var(--bg-secondary); border:none;
+      padding:.5rem 1.2rem; border-radius:999px; cursor:pointer; font-weight:600;
+      font-size:.85rem; transition:all 0.3s;
+    }
+    .lang-switch:hover { transform:translateY(-2px); box-shadow:0 4px 12px rgba(0,0,0,0.15); }
+    
+    .tabs {
+      display:flex; gap:0; border-bottom:2px solid var(--border-light);
+    }
+    .tab {
+      padding:.8rem 2rem; background:transparent; border:none;
+      font-weight:600; font-size:.95rem; color:var(--text-secondary);
+      cursor:pointer; border-bottom:3px solid transparent;
+      transition:all 0.3s;
+    }
+    .tab:hover { color:var(--text-primary); background:rgba(0,0,0,0.02); }
+    .tab.active {
+      color:var(--accent-dark); border-bottom-color:var(--accent-gold);
+      background:rgba(244,208,63,0.1);
+    }
+    
+    main { max-width:1600px; margin:0 auto; padding:2rem; }
+    .tab-content { display:none; }
+    .tab-content.active { display:block; }
+    
+    .stat-grid {
+      display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+      gap:1rem; margin-bottom:1rem;
+    }
+    .main-layout {
+      display:grid;
+      grid-template-columns:1fr minmax(400px,600px) 1fr;
+      grid-template-rows:auto auto auto;
+      gap:1.5rem;
+      margin-top:2rem;
+    }
+    .center-column {
+      grid-column: 2;
+      display:flex;
+      flex-direction:column;
+      gap:1.5rem;
+    }
+    .side-cards {
+      display:flex;
+      flex-direction:column;
+      gap:1.5rem;
+    }
+    .left-side { grid-column:1; grid-row:1 / span 3; }
+    .right-side { grid-column:3; grid-row:1 / span 3; }
+    .bento-card {
+      background:var(--bg-card); border-radius:24px; padding:1.8rem;
+      box-shadow:var(--shadow); border:1px solid var(--border-light);
+      transition:all 0.3s; position:relative; overflow:hidden;
+    }
+    .bento-card:hover { transform:translateY(-4px); box-shadow:var(--shadow-hover); }
+    .bento-card.disabled {
+      opacity:0.5; pointer-events:none;
+      filter:grayscale(1);
+    }
+    .card-title { font-size:1.1rem; font-weight:700; margin-bottom:1.2rem; display:flex; align-items:center; gap:.5rem; }
+    .card-icon {
+      width:32px; height:32px; background:var(--accent-gold);
+      border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:1.2rem;
+    }
+    .device-card {
+      background:linear-gradient(135deg,var(--bg-card) 0%,var(--bg-secondary) 100%);
+      min-height:350px; display:flex; flex-direction:column;
+      align-items:center; justify-content:center;
+    }
+    .relay-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:.8rem; }
+    .relay-item { display:flex; flex-direction:column; gap:.5rem; }
+    .relay-label { font-size:.8rem; font-weight:600; color:var(--text-secondary); }
+    .relay-btn {
+      background:var(--accent-dark); color:var(--bg-secondary); border:none;
+      padding:.7rem; border-radius:999px; cursor:pointer; font-weight:600;
+      font-size:.85rem; transition:all 0.3s;
+    }
+    .relay-btn.on {
+      background:var(--accent-gold); color:var(--accent-dark);
+      box-shadow:0 4px 12px rgba(244,208,63,0.4);
+    }
+    .relay-btn:active { transform:scale(0.95); }
+    .input-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:.6rem; }
+    .input-pill {
+      padding:.6rem .4rem; border-radius:16px; text-align:center;
+      font-size:.75rem; font-weight:600; border:2px solid var(--border-light);
+      background:var(--bg-secondary); transition:all 0.3s;
+    }
+    .input-pill.high {
+      background:var(--accent-gold); border-color:var(--accent-gold);
+      color:var(--accent-dark); box-shadow:0 4px 12px rgba(244,208,63,0.3);
+    }
+    .sensor-row {
+      display:flex; justify-content:space-between; align-items:center;
+      padding:.8rem 0; border-bottom:1px solid var(--border-light); font-size:.9rem;
+    }
+    .sensor-row:last-child { border-bottom:none; }
+    .sensor-label { color:var(--text-secondary); font-weight:500; }
+    .sensor-value { font-weight:700; color:var(--text-primary); }
+    
+    .pump-controls { display:grid; gap:1rem; }
+    .pump-row { display:grid; grid-template-columns:120px 1fr; gap:1rem; align-items:center; }
+    .pump-label { font-weight:600; color:var(--text-secondary); }
+    .toggle-switch {
+      position:relative; width:60px; height:30px; background:#ccc;
+      border-radius:999px; cursor:pointer; transition:all 0.3s;
+    }
+    .toggle-switch.on { background:var(--accent-gold); }
+    .toggle-switch::after {
+      content:''; position:absolute; top:3px; left:3px; width:24px; height:24px;
+      background:white; border-radius:50%; transition:all 0.3s;
+    }
+    .toggle-switch.on::after { left:33px; }
+    .speed-slider {
+      width:100%; height:8px; border-radius:999px;
+      background:var(--border-light); outline:none; -webkit-appearance:none;
+    }
+    .speed-slider::-webkit-slider-thumb {
+      -webkit-appearance:none; width:24px; height:24px; border-radius:50%;
+      background:var(--accent-gold); cursor:pointer;
+      box-shadow:0 4px 12px rgba(244,208,63,0.4);
+    }
+    .speed-display {
+      font-size:2rem; font-weight:700; text-align:center;
+      color:var(--accent-dark); margin:1rem 0;
+    }
+    
+    .balance-main {
+      font-size:3rem; font-weight:700; text-align:center;
+      color:var(--accent-dark); margin:2rem 0; min-height:80px;
+      display:flex; align-items:center; justify-content:center;
+    }
+    .balance-status {
+      display:flex; align-items:center; gap:8px; font-size:.9rem;
+      padding:.5rem 1rem; border-radius:999px; background:var(--bg-primary);
+    }
+    .balance-status.online { color:#16a34a; }
+    .balance-status.offline { color:#dc2626; }
+    .status-circle {
+      width:8px; height:8px; border-radius:50%; background:currentColor;
+    }
+    
+    table {
+      width:100%; border-collapse:collapse; font-size:.9rem;
+    }
+    th, td {
+      padding:.8rem; text-align:left; border-bottom:1px solid var(--border-light);
+    }
+    th { font-weight:600; color:var(--text-secondary); background:var(--bg-primary); }
+    
+    .btn-primary {
+      background:var(--accent-dark); color:var(--bg-secondary); border:none;
+      padding:.6rem 1.5rem; border-radius:999px; cursor:pointer;
+      font-weight:600; font-size:.85rem; transition:all 0.3s;
+    }
+    .btn-primary:hover { transform:translateY(-2px); box-shadow:0 4px 12px rgba(0,0,0,0.15); }
+    
+    @media (max-width:1200px){
+      .main-layout{
+        grid-template-columns:1fr;
+        grid-template-rows:auto;
+      }
+      .center-column{grid-column:1;}
+      .left-side{grid-column:1; grid-row:auto;}
+      .right-side{grid-column:1; grid-row:auto;}
+    }
+    @media (max-width:768px){
+      main{padding:1rem;} header{padding:1rem;}
+      .tabs { overflow-x:auto; }
+      .tab { padding:.6rem 1.2rem; font-size:.85rem; }
+      .relay-grid{grid-template-columns:repeat(2,1fr);}
+      .input-grid{grid-template-columns:repeat(2,1fr);}
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-top">
+      <div class="logo">
+        <div class="logo-icon">S</div>
+        <span id="header-title">StamPLC Complete</span>
+      </div>
+      <div class="header-right">
+        <div class="ip-badge">
+          <span>IP:</span> <span id="ip-text">-</span>
+          <span class="status-dot"></span>
+        </div>
+        <button class="lang-switch" onclick="toggleLang()">
+          <span id="lang-btn">EN</span>
+        </button>
+      </div>
+    </div>
+    <div class="tabs">
+      <button class="tab active" onclick="switchTab('stamplc')">
+        <span id="tab-stamplc">🖥️ StamPLC</span>
+      </button>
+      <button class="tab" onclick="switchTab('pump')">
+        <span id="tab-pump">⚙️ Pompe</span>
+      </button>
+      <button class="tab" onclick="switchTab('balance')">
+        <span id="tab-balance">⚖️ Balance</span>
+      </button>
+      <button class="tab" onclick="switchTab('settings')">
+        <span id="tab-settings">⚙️ Réglages</span>
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <div id="tab-content-stamplc" class="tab-content active">
+      <div class="stat-grid">
+        <div class="bento-card" style="padding:1.2rem;">
+          <div style="font-size:.8rem;color:var(--text-secondary);margin-bottom:.3rem;">Température</div>
+          <div style="font-size:1.8rem;font-weight:700;" id="temp-stat">-</div>
+        </div>
+        <div class="bento-card" style="padding:1.2rem;">
+          <div style="font-size:.8rem;color:var(--text-secondary);margin-bottom:.3rem;">Alimentation</div>
+          <div style="font-size:1.8rem;font-weight:700;" id="power-stat">-</div>
+        </div>
+        <div class="bento-card" style="padding:1.2rem;">
+          <div style="font-size:.8rem;color:var(--text-secondary);margin-bottom:.3rem;">Sortie DAC</div>
+          <div style="font-size:1.8rem;font-weight:700;" id="dac-stat">-</div>
+        </div>
+      </div>
+
+      <div class="main-layout">
+        <div class="side-cards left-side">
+          <div class="bento-card">
+            <h2 class="card-title">
+              <div class="card-icon">📊</div>
+              <span>Capteurs & Horloge</span>
+            </h2>
+            <div>
+              <div class="sensor-row">
+                <span class="sensor-label">Température interne</span>
+                <span class="sensor-value" id="temp">-</span>
+              </div>
+              <div class="sensor-row">
+                <span class="sensor-label">Tension alimentation</span>
+                <span class="sensor-value" id="vcc">-</span>
+              </div>
+              <div class="sensor-row">
+                <span class="sensor-label">Courant sortie IO</span>
+                <span class="sensor-value" id="io">-</span>
+              </div>
+              <div class="sensor-row">
+                <span class="sensor-label">Horloge RTC</span>
+                <span class="sensor-value" id="rtc">-</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="center-column">
+          <div class="bento-card">
+            <h2 class="card-title">
+              <div class="card-icon">📥</div>
+              <span>Entrées digitales (8 opto)</span>
+            </h2>
+            <div class="input-grid" id="inputs-container"></div>
+          </div>
+
+          <div class="bento-card device-card">
+            <div style="font-size:4rem;margin-bottom:1rem;">🖥️</div>
+            <h2 style="font-size:1.5rem;font-weight:700;color:var(--accent-dark);margin-bottom:0.5rem;">M5 StamPLC</h2>
+            <div style="text-align:center;color:var(--text-secondary);font-size:.9rem;">
+              ESP32 Industrial Controller
+            </div>
+          </div>
+
+          <div class="bento-card">
+            <h2 class="card-title">
+              <div class="card-icon">⚡</div>
+              <span>Relais (4 canaux)</span>
+            </h2>
+            <div class="relay-grid" id="relays-container"></div>
+          </div>
+        </div>
+
+        <div class="side-cards right-side">
+          <div class="bento-card">
+            <h2 class="card-title">
+              <div class="card-icon">🔊</div>
+              <span>Buzzer</span>
+            </h2>
+            <p style="font-size:.85rem;color:var(--text-secondary);margin-bottom:1rem;">
+               Émettre un bip court via le buzzer intégré.
+            </p>
+            <div style="display:flex;gap:.8rem;">
+              <button class="btn-primary" onclick="beep()" style="flex:1;">Bip court</button>
+              <button class="btn-primary" onclick="stopBeep()" style="flex:1;background:var(--bg-primary);color:var(--text-primary);border:1px solid var(--border-light);">Stop</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-content-pump" class="tab-content">
+      <div class="bento-card" style="max-width:800px;margin:2rem auto;">
+        <h2 class="card-title">
+          <div class="card-icon">⚙️</div>
+          <span>Contrôle Pompe</span>
+        </h2>
+        <div class="pump-controls">
+          <div class="pump-row">
+            <div class="pump-label">Marche/Arrêt</div>
+            <div class="toggle-switch" id="pump-power" onclick="togglePumpPower()"></div>
+          </div>
+          <div class="pump-row">
+            <div class="pump-label">Sens rotation</div>
+            <div style="display:flex;gap:1rem;">
+              <button class="btn-primary" id="btn-forward" onclick="setPumpDirection('forward')" style="flex:1;">▶️ Forward</button>
+              <button class="btn-primary" id="btn-reverse" onclick="setPumpDirection('reverse')" style="flex:1;opacity:0.5;">◀️ Reverse</button>
+            </div>
+          </div>
+          <div class="pump-row">
+            <div class="pump-label">Vitesse</div>
+            <div style="flex:1;">
+              <div class="speed-display" id="speed-display">0%</div>
+              <input type="range" class="speed-slider" id="speed-slider" min="0" max="100" step="1" value="0">
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-content-balance" class="tab-content">
+      <div class="bento-card" style="max-width:1200px;margin:0 auto;" id="balance-card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:2rem;">
+          <h2 class="card-title">
+            <div class="card-icon">⚖️</div>
+            <span>Balance de précision</span>
+          </h2>
+          <div class="balance-status" id="balance-status">
+            <div class="status-circle"></div>
+            <span>Hors ligne</span>
+          </div>
+        </div>
+        
+        <div class="balance-main" id="balance-weight">---</div>
+        
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:2rem;">
+          <div class="sensor-row">
+            <span class="sensor-label">Dernière mise à jour</span>
+            <span class="sensor-value" id="balance-timestamp">-</span>
+          </div>
+          <div class="sensor-row">
+            <span class="sensor-label">Type de balance</span>
+            <span class="sensor-value" id="balance-type">-</span>
+          </div>
+          <div class="sensor-row">
+            <span class="sensor-label">Vitesse (baud)</span>
+            <span class="sensor-value" id="balance-baud">-</span>
+          </div>
+        </div>
+
+        <h3 style="font-size:1.1rem;font-weight:700;margin:2rem 0 1rem;">Historique</h3>
+        <div style="overflow-x:auto;">
+          <table id="history-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Poids</th>
+                <th>Date/Heure</th>
+              </tr>
+            </thead>
+            <tbody id="history-body">
+              <tr><td colspan="3" style="text-align:center;color:var(--text-secondary);">Aucune donnée</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3 style="font-size:1.1rem;font-weight:700;margin:2rem 0 1rem;">Graphique</h3>
+        <div style="height:300px;">
+          <canvas id="weight-chart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <div id="tab-content-settings" class="tab-content">
+      <div class="bento-card" style="max-width:800px;margin:2rem auto;">
+        <h2 class="card-title">
+          <div class="card-icon">⚙️</div>
+          <span>Configuration AtomS3 Balance</span>
+        </h2>
+        
+        <div style="margin-bottom:2rem;">
+          <label style="display:flex;align-items:center;gap:10px;font-size:1rem;margin-bottom:1rem;">
+            <input type="checkbox" id="atoms3-enabled" style="width:20px;height:20px;">
+            <span style="font-weight:600;">Activer la connexion à l'AtomS3</span>
+          </label>
+          
+          <div style="margin-bottom:1rem;">
+            <label style="display:block;font-weight:600;margin-bottom:0.5rem;color:var(--text-secondary);">
+              IP ou Hostname de l'AtomS3
+            </label>
+            <input 
+              type="text" 
+              id="atoms3-host" 
+              placeholder="192.168.1.100 ou easylogger-1234.local"
+              style="width:100%;padding:12px;border:1px solid var(--border-light);border-radius:10px;font-size:1rem;"
+            >
+            <div style="font-size:0.85rem;color:var(--text-secondary);margin-top:0.5rem;">
+              💡 L'IP s'affiche sur l'écran de l'AtomS3 au démarrage
+            </div>
+          </div>
+          
+          <div style="display:flex;gap:1rem;margin-top:1.5rem;">
+            <button class="btn-primary" onclick="testAtomS3Connection()" style="flex:1;">
+              🔍 Tester la connexion
+            </button>
+            <button class="btn-primary" onclick="saveAtomS3Config()" style="flex:1;background:var(--accent-gold);color:var(--accent-dark);">
+              💾 Enregistrer
+            </button>
+          </div>
+          
+          <div id="connection-result" style="margin-top:1rem;padding:1rem;border-radius:10px;display:none;"></div>
+        </div>
+        
+        <hr style="border:0;border-top:1px solid var(--border-light);margin:2rem 0;">
+        
+        <div>
+          <h3 style="font-size:1rem;font-weight:700;margin-bottom:1rem;">Informations AtomS3</h3>
+          <div class="sensor-row">
+            <span class="sensor-label">État</span>
+            <span class="sensor-value" id="atoms3-status-text">-</span>
+          </div>
+          <div class="sensor-row">
+            <span class="sensor-label">IP configurée</span>
+            <span class="sensor-value" id="atoms3-ip-text">-</span>
+          </div>
+          <div class="sensor-row">
+            <span class="sensor-label">Dernière pesée</span>
+            <span class="sensor-value" id="atoms3-last-weight">-</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <script>
+    var currentLang = 'fr';
+    var currentTab = 'stamplc';
+    var pumpPower = false;
+    var pumpDirection = 'forward';
+    var pumpSpeed = 0;
+    var weightChart = null;
+
+    function switchTab(tab) {
+      currentTab = tab;
+      document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+      document.querySelectorAll('.tab-content').forEach(function(c) { c.classList.remove('active'); });
+      var tabBtn = document.querySelector('[onclick*="' + tab + '"]');
+      if(tabBtn) tabBtn.classList.add('active');
+      var content = document.getElementById('tab-content-' + tab);
+      if(content) content.classList.add('active');
+      
+      if (tab === 'balance') {
+        setTimeout(updateBalanceData, 100);
+      } else if (tab === 'settings') {
+        loadAtomS3Config();
+      }
+    }
+
+    function toggleLang() {
+      currentLang = currentLang === 'fr' ? 'en' : 'fr';
+      document.getElementById('lang-btn').textContent = currentLang === 'fr' ? 'EN' : 'FR';
+    }
+
+    function fetchStatus() {
+      fetch('/api/status')
+        .then(function(res) {
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          return res.json();
+        })
+        .then(function(d) {
+          document.getElementById('ip-text').textContent = d.ip || '-';
+
+          var temp_c  = (d.sensors && typeof d.sensors.temp_c !== 'undefined') ? d.sensors.temp_c : '-';
+          var power_v = (d.sensors && typeof d.sensors.power_v !== 'undefined') ? d.sensors.power_v : '-';
+          var io_cur  = (d.sensors && typeof d.sensors.io_current_a !== 'undefined') ? d.sensors.io_current_a : '-';
+
+          document.getElementById('temp-stat').textContent = temp_c + '°C';
+          document.getElementById('power-stat').textContent = power_v + 'V';
+          document.getElementById('temp').textContent = temp_c + ' °C';
+          document.getElementById('vcc').textContent  = power_v + ' V';
+          document.getElementById('io').textContent   = io_cur  + ' A';
+          document.getElementById('rtc').textContent  = d.rtc || '-';
+
+          if (typeof d.dac_mv !== 'undefined') {
+            var v = d.dac_mv / 1000.0;
+            document.getElementById('dac-stat').textContent = v.toFixed(1) + 'V';
+          }
+
+          var relaysContainer = document.getElementById('relays-container');
+          relaysContainer.innerHTML = '';
+          var relays = d.relays || [];
+          for (var i = 0; i < relays.length; i++) {
+            var isOn = (relays[i] === true || relays[i] === 1);
+            
+            var item  = document.createElement('div');
+            item.className = 'relay-item';
+
+            var label = document.createElement('div');
+            label.className = 'relay-label';
+            label.textContent = 'Relais ' + i;
+
+            var btn = document.createElement('button');
+            btn.className = 'relay-btn' + (isOn ? ' on' : '');
+            btn.textContent = isOn ? 'ON' : 'OFF';
+            btn.onclick = (function(idx, state) {
+              return function() { toggleRelay(idx, state ? 0 : 1); };
+            })(i, isOn);
+
+            item.appendChild(label);
+            item.appendChild(btn);
+            relaysContainer.appendChild(item);
+          }
+
+          var inputsContainer = document.getElementById('inputs-container');
+          inputsContainer.innerHTML = '';
+          var inputs = d.inputs || [];
+          for (var j = 0; j < inputs.length; j++) {
+            var isHigh = (inputs[j] === true || inputs[j] === 1);
+            
+            var pill = document.createElement('div');
+            pill.className = 'input-pill ' + (isHigh ? 'high' : 'low');
+            pill.innerHTML = '<div style="font-size:0.65rem;opacity:0.7;">IN' + j + '</div><div style="font-weight:700;">' + (isHigh ? 'HIGH' : 'LOW') + '</div>';
+            inputsContainer.appendChild(pill);
+          }
+
+        })
+        .catch(function(e) {
+          console.error('Fetch error:', e);
+        });
+    }
+
+    function toggleRelay(ch, state) {
+      fetch('/api/relay?ch=' + ch + '&state=' + state)
+        .then(function() { fetchStatus(); })
+        .catch(function(e) { console.error('Relay error:', e); });
+    }
+
+    function beep() {
+      fetch('/api/buzzer?state=1').catch(function(e) { console.error('Buzzer error:', e); });
+    }
+
+    function stopBeep() {
+      fetch('/api/buzzer?state=0').catch(function(e) { console.error('Stop error:', e); });
+    }
+
+    function togglePumpPower() {
+      pumpPower = !pumpPower;
+      var toggle = document.getElementById('pump-power');
+      if (pumpPower) {
+        toggle.classList.add('on');
+        toggleRelay(0, 1);
+      } else {
+        toggle.classList.remove('on');
+        toggleRelay(0, 0);
+      }
+    }
+
+    function setPumpDirection(dir) {
+      pumpDirection = dir;
+      var btnFwd = document.getElementById('btn-forward');
+      var btnRev = document.getElementById('btn-reverse');
+      if (dir === 'forward') {
+        btnFwd.style.opacity = '1';
+        btnRev.style.opacity = '0.5';
+        toggleRelay(1, 0);
+      } else {
+        btnFwd.style.opacity = '0.5';
+        btnRev.style.opacity = '1';
+        toggleRelay(1, 1);
+      }
+    }
+
+    document.getElementById('speed-slider').addEventListener('change', function() {
+      pumpSpeed = parseInt(this.value);
+      document.getElementById('speed-display').textContent = pumpSpeed + '%';
+      var mv = Math.round((pumpSpeed / 100) * 10000);
+      fetch('/api/dac?mv=' + mv).catch(function(e) { console.error('DAC error:', e); });
+    });
+
+    document.getElementById('speed-slider').addEventListener('input', function() {
+      pumpSpeed = parseInt(this.value);
+      document.getElementById('speed-display').textContent = pumpSpeed + '%';
+    });
+
+    function updateBalanceData() {
+      fetch('/api/balance')
+        .then(function(res) {
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          return res.json();
+        })
+        .then(function(d) {
+          var card = document.getElementById('balance-card');
+          var statusDiv = document.getElementById('balance-status');
+          
+          if (d.online) {
+            card.classList.remove('disabled');
+            statusDiv.classList.remove('offline');
+            statusDiv.classList.add('online');
+            statusDiv.innerHTML = '<div class="status-circle"></div><span>En ligne</span>';
+            
+            document.getElementById('balance-weight').textContent = d.weight || '---';
+            document.getElementById('balance-timestamp').textContent = d.timestamp || '-';
+            document.getElementById('balance-type').textContent = d.balanceType || '-';
+            document.getElementById('balance-baud').textContent = d.baudRate || '-';
+            
+            if (d.history && d.history.length > 0) {
+              var tbody = document.getElementById('history-body');
+              tbody.innerHTML = '';
+              d.history.slice().reverse().forEach(function(item, idx) {
+                var row = document.createElement('tr');
+                row.innerHTML = '<td>' + (d.history.length - idx) + '</td><td>' + item.weight + '</td><td>' + item.timestamp + '</td>';
+                tbody.appendChild(row);
+              });
+              
+              updateChart(d.history);
+            }
+          } else {
+            card.classList.add('disabled');
+            statusDiv.classList.remove('online');
+            statusDiv.classList.add('offline');
+            statusDiv.innerHTML = '<div class="status-circle"></div><span>Hors ligne</span>';
+            document.getElementById('balance-weight').textContent = '---';
+          }
+        })
+        .catch(function(e) {
+          console.error('Balance fetch error:', e);
+          var card = document.getElementById('balance-card');
+          var statusDiv = document.getElementById('balance-status');
+          card.classList.add('disabled');
+          statusDiv.classList.remove('online');
+          statusDiv.classList.add('offline');
+          statusDiv.innerHTML = '<div class="status-circle"></div><span>Hors ligne</span>';
+        });
+    }
+
+    function updateChart(history) {
+      var ctx = document.getElementById('weight-chart');
+      if (!ctx) return;
+      
+      var labels = [];
+      var data = [];
+      
+      history.forEach(function(item) {
+        labels.push(item.timestamp.substring(11, 19));
+        var weightNum = parseFloat(item.weight.replace(/[^\d.-]/g, ''));
+        data.push(isNaN(weightNum) ? null : weightNum);
+      });
+      
+      if (weightChart) {
+        weightChart.destroy();
+      }
+      
+      weightChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: labels,
+          datasets: [{
+            label: 'Poids',
+            data: data,
+            borderColor: '#f4d03f',
+            backgroundColor: 'rgba(244,208,63,0.1)',
+            tension: 0.3,
+            fill: true
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: false }
+          },
+          scales: {
+            y: { beginAtZero: false }
+          }
+        }
+      });
+    }
+
+    fetchStatus();
+    setInterval(fetchStatus, 1000);
+    setInterval(function() {
+      if (currentTab === 'balance') {
+        updateBalanceData();
+      }
+    }, 2000);
+    
+    loadAtomS3Config();
+    
+    function loadAtomS3Config() {
+      fetch('/api/config')
+        .then(function(res) { return res.json(); })
+        .then(function(data) {
+          document.getElementById('atoms3-host').value = data.atoms3_host || '';
+          document.getElementById('atoms3-enabled').checked = data.atoms3_enabled || false;
+          document.getElementById('atoms3-ip-text').textContent = data.atoms3_host || '-';
+          document.getElementById('atoms3-status-text').textContent = data.atoms3_enabled ? 'Activé' : 'Désactivé';
+        })
+        .catch(function(e) { console.error('Config load error:', e); });
+    }
+    
+    function saveAtomS3Config() {
+      var host = document.getElementById('atoms3-host').value;
+      var enabled = document.getElementById('atoms3-enabled').checked;
+      
+      var formData = new FormData();
+      formData.append('atoms3_host', host);
+      if (enabled) formData.append('atoms3_enabled', 'true');
+      
+      fetch('/api/config', {
+        method: 'POST',
+        body: formData
+      })
+        .then(function(res) { return res.text(); })
+        .then(function(text) {
+          showConnectionResult('✅ Configuration enregistrée !', 'success');
+          loadAtomS3Config();
+          setTimeout(function() {
+            window.location.reload();
+          }, 1500);
+        })
+        .catch(function(e) {
+          showConnectionResult('❌ Erreur lors de la sauvegarde', 'error');
+        });
+    }
+    
+    function testAtomS3Connection() {
+      var host = document.getElementById('atoms3-host').value;
+      if (!host) {
+        showConnectionResult('⚠️ Veuillez entrer une IP ou un hostname', 'warning');
+        return;
+      }
+      
+      showConnectionResult('🔄 Test en cours...', 'info');
+      
+      fetch('http://' + host + '/status')
+        .then(function(res) {
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          return res.json();
+        })
+        .then(function(data) {
+          var weight = data.lastWeight || 'N/A';
+          showConnectionResult('✅ Connexion OK ! Dernière pesée : ' + weight, 'success');
+          document.getElementById('atoms3-last-weight').textContent = weight;
+        })
+        .catch(function(e) {
+          showConnectionResult('❌ Impossible de se connecter à l\'AtomS3. Vérifiez l\'IP/hostname.', 'error');
+        });
+    }
+    
+    function showConnectionResult(message, type) {
+      var resultDiv = document.getElementById('connection-result');
+      resultDiv.style.display = 'block';
+      resultDiv.textContent = message;
+      
+      var colors = {
+        success: { bg: '#d4edda', text: '#155724' },
+        error: { bg: '#f8d7da', text: '#721c24' },
+        warning: { bg: '#fff3cd', text: '#856404' },
+        info: { bg: '#d1ecf1', text: '#0c5460' }
+      };
+      
+      var color = colors[type] || colors.info;
+      resultDiv.style.background = color.bg;
+      resultDiv.style.color = color.text;
+      resultDiv.style.border = '1px solid ' + color.text;
+    }
+  </script>
+</body>
+</html>
