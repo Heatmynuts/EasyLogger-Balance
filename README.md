@@ -1,6 +1,6 @@
 # EasyLogger Balance
 
-**Balance WiFi pour M5AtomS3** - Fonctionne avec le projet [StamPLC_Complete_SPIFFS](https://github.com/Heatmynuts/StamPLC_Complete_SPIFFS)
+**Balance WiFi pour M5AtomS3**
 
 ## Description
 
@@ -8,11 +8,10 @@ EasyLogger Balance est un firmware pour M5AtomS3 qui permet de connecter une bal
 
 ## Caractéristiques
 
-- 📡 **Connexion WiFi** - Se connecte automatiquement au réseau du StamPLC
+- 📡 **Connexion WiFi** - Mode client ou AP
 - ⚖️ **Support multi-balances** - Compatible A&D et Sartorius
 - 🔄 **Temps réel** - Transmission WebSocket à 20 pesées/seconde
 - 🖥️ **Interface Web** - Configuration et monitoring intégrés
-- 🎛️ **Mode StamPLC** - Format de données normalisé pour EasyDose
 
 ## Compatibilité
 
@@ -21,6 +20,12 @@ EasyLogger Balance est un firmware pour M5AtomS3 qui permet de connecter une bal
 | A&D | 2400 | 7E1 | ✅ Testé |
 | Sartorius BCE | 9600 | 8O1 | ✅ Testé |
 
+## Option DAC2 (Unit DAC2 GP8413)
+
+Sortie analogique 0-10V proportionnelle à la pesée. Convertisseur 15 bits I2C avec étalonnage 6 points pour corriger les interférences.
+
+**Bibliothèque requise :** DFRobot_GP8XXX (via Gestionnaire de bibliothèques Arduino)
+
 ## Installation
 
 1. Ouvrir `ATOMS3-GCA.ino` dans Arduino IDE
@@ -28,13 +33,6 @@ EasyLogger Balance est un firmware pour M5AtomS3 qui permet de connecter une bal
 3. Téléverser le code
 4. Se connecter au réseau WiFi `Easylogger-XXXX` (mot de passe: `easylogger`)
 5. Accéder à l'interface web pour configurer
-
-## Configuration avec StamPLC
-
-1. Dans les **Réglages** de l'AtomS3, activer "Connexion automatique au réseau StamPLC"
-2. Entrer le SSID et mot de passe du réseau WiFi
-3. Activer le **Mode StamPLC** pour le format de données normalisé
-4. Dans EasyDose (StamPLC), configurer l'adresse IP de l'AtomS3
 
 ## API
 
@@ -56,8 +54,4 @@ Les pesées sont diffusées en temps réel au format JSON :
 ## Licence
 
 MIT License - BDP France
-
-## Voir aussi
-
-- [StamPLC_Complete_SPIFFS](https://github.com/Heatmynuts/StamPLC_Complete_SPIFFS) - Contrôleur de dosage EasyDose
 

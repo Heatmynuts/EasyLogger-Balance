@@ -2,7 +2,7 @@
  * Easylogger M5AtomS3
  * BDP France - Version 2.1
  * 
- * Affichage local avec connexion automatique au réseau StamPLC
+ * Affichage local
  */
 
 #include "M5AtomS3.h"
@@ -13,6 +13,8 @@
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <time.h>
+#include <Wire.h>
+#include <DFRobot_GP8XXX.h>
 
 // -------- RS232 (base M5 RS232) --------
 static const int PIN_RX = 5, PIN_TX = 6;
@@ -53,24 +55,29 @@ struct AppConfig {
   bool   showWifiIndicator = true;
   uint8_t dtFormat = 0;
 
-  // Balance
-  uint8_t balanceType = 0;
+  // Balance - Par défaut : A&D, 2400, 7E1, CRLF, contrôle flux aucun
+  uint8_t balanceType = 0;     // 0=A&D, 1=Sartorius
   uint32_t balanceBaud = 2400;
   bool swapRxTx = false;
   
-  // Mode StamPLC - Normalise le format des données pour le StamPLC
-  bool stamplcMode = false;
-  uint8_t dataBits = 7;
-  uint8_t parity = 1;
-  uint8_t stopBits = 1;
-  uint8_t handshake = 0;
-  char terminator[5] = "\r\n";
+  uint8_t dataBits = 7;        // 7 bits
+  uint8_t parity = 1;          // 0=Aucune, 1=Paire (E), 2=Impaire (O)
+  uint8_t stopBits = 1;        // 1 bit d'arrêt
+  uint8_t handshake = 0;       // 0=Aucun, 1=RTS/CTS, 2=XON/XOFF
+  char terminator[5] = "\r\n"; // CRLF
   
-  // Connexion automatique au réseau StamPLC
-  bool autoConnectStamPLC = true;     // Se connecter automatiquement au réseau du StamPLC
-  char stamplc_ssid[33] = "Wifi Unifi"; // SSID du réseau StamPLC
-  char stamplc_pass[65] = "Wrangler2012."; // Mot de passe du réseau StamPLC
+  // Sortie DAC2 (Unit DAC2 GP8413 - 15 bits, I2C 0x59)
+  bool dac2_enabled = false;
+  float dac2_range_min = 0.0f;      // Plage début (g)
+  float dac2_range_max = 1000.0f;   // Plage fin (g)
+  float dac2_cal_weight[6] = {0, 200, 400, 600, 800, 1000};  // Points calibration (g)
+  uint16_t dac2_cal_mv[6] = {0, 2000, 4000, 6000, 8000, 10000}; // mV correspondants (0-10000)
 } cfg;
+
+// DAC2 GP8413 (I2C 0x59, 15 bits, 0-10V) - Unit DAC2 sur bus I2C
+#define DAC2_I2C_ADDR 0x59
+DFRobot_GP8413 g_dac2(DAC2_I2C_ADDR);
+bool dac2Ok = false;
 
 Preferences prefs;
 WebServer server(80);
@@ -327,11 +334,17 @@ void saveConfig() {
   prefs.putUChar("stop",    cfg.stopBits);
   prefs.putUChar("hshake",  cfg.handshake);
   prefs.putString("term",   cfg.terminator);
-  // Connexion automatique StamPLC
-  prefs.putBool("autostamplc", cfg.autoConnectStamPLC);
-  prefs.putString("stamplcssid", cfg.stamplc_ssid);
-  prefs.putString("stamplcpass", cfg.stamplc_pass);
-  prefs.putBool("stamplcmode", cfg.stamplcMode);
+  // DAC2
+  prefs.putBool("dac2en", cfg.dac2_enabled);
+  prefs.putFloat("dac2min", cfg.dac2_range_min);
+  prefs.putFloat("dac2max", cfg.dac2_range_max);
+  for (int i = 0; i < 6; i++) {
+    char kw[8], km[8];
+    snprintf(kw, sizeof(kw), "d2w%d", i);
+    snprintf(km, sizeof(km), "d2m%d", i);
+    prefs.putFloat(kw, cfg.dac2_cal_weight[i]);
+    prefs.putUShort(km, cfg.dac2_cal_mv[i]);
+  }
   prefs.end();
 }
 
@@ -378,11 +391,17 @@ void loadConfig() {
     cfg.handshake = prefs.getUChar("hshake", 0);
     s = prefs.getString("term", "\r\n"); s.toCharArray(cfg.terminator, sizeof(cfg.terminator));
   }
-  // Connexion automatique StamPLC
-  cfg.autoConnectStamPLC = prefs.getBool("autostamplc", true);  // Par défaut: activé
-  s = prefs.getString("stamplcssid", "Wifi Unifi"); s.toCharArray(cfg.stamplc_ssid, sizeof(cfg.stamplc_ssid));
-  s = prefs.getString("stamplcpass", "Wrangler2012."); s.toCharArray(cfg.stamplc_pass, sizeof(cfg.stamplc_pass));
-  cfg.stamplcMode = prefs.getBool("stamplcmode", false);
+  // DAC2
+  cfg.dac2_enabled = prefs.getBool("dac2en", false);
+  cfg.dac2_range_min = prefs.getFloat("dac2min", 0.0f);
+  cfg.dac2_range_max = prefs.getFloat("dac2max", 1000.0f);
+  for (int i = 0; i < 6; i++) {
+    char kw[8], km[8];
+    snprintf(kw, sizeof(kw), "d2w%d", i);
+    snprintf(km, sizeof(km), "d2m%d", i);
+    cfg.dac2_cal_weight[i] = prefs.getFloat(kw, cfg.dac2_range_min + (cfg.dac2_range_max - cfg.dac2_range_min) * i / 5.0f);
+    cfg.dac2_cal_mv[i] = (uint16_t)prefs.getUShort(km, (uint16_t)(10000U * i / 5));
+  }
   prefs.end();
 
   cfg.fontMain = constrain(cfg.fontMain, (uint8_t)1, (uint8_t)3);
@@ -461,26 +480,14 @@ void startAP() {
 }
 
 bool startClientWiFi() {
-  // Si autoConnectStamPLC est activé, utiliser le réseau StamPLC
-  // Sinon, utiliser le réseau WiFi personnalisé si configuré
-  // Si aucune connexion ne fonctionne, l'AtomS3 démarrera en mode AP (autonome)
-  const char* ssidToUse = cfg.ssid;
-  const char* passToUse = cfg.pass;
-  bool useStamPLC = false;
-  
-  if (cfg.autoConnectStamPLC && strlen(cfg.stamplc_ssid) > 0) {
-    ssidToUse = cfg.stamplc_ssid;
-    passToUse = cfg.stamplc_pass;
-    useStamPLC = true;
-    Serial.println("[WiFi] Mode auto-connexion StamPLC activé");
-    Serial.println("[WiFi] Note: Si la connexion échoue, l'AtomS3 démarrera en mode AP (autonome)");
-  } else if (!cfg.client_enabled || strlen(cfg.ssid)==0) {
+  if (!cfg.client_enabled || strlen(cfg.ssid)==0) {
     Serial.println("[WiFi] Pas de configuration WiFi client - démarrage en mode AP");
     return false;
-  } else {
-    Serial.println("[WiFi] Mode WiFi personnalisé");
-    Serial.println("[WiFi] Note: Si la connexion échoue, l'AtomS3 démarrera en mode AP (autonome)");
   }
+  
+  const char* ssidToUse = cfg.ssid;
+  const char* passToUse = cfg.pass;
+  Serial.println("[WiFi] Note: Si la connexion échoue, l'AtomS3 démarrera en mode AP (réseau Easylogger-XXXX)");
 
   WiFi.mode(WIFI_STA);
 
@@ -561,35 +568,42 @@ input::placeholder{color:#6e7bb3}.row{display:grid;gap:12px}@media (min-width:56
 .meta{font-size:var(--fs-small);color:#9aa7d1;margin-top:8px}.kv{display:grid;grid-template-columns:160px 1fr;gap:8px;font-size:var(--fs-small)}
 hr{border:0;border-top:1px solid #2a3350;margin:12px 0}.footer{margin-top:22px;text-align:center;color:#9aa7d1;font-size:var(--fs-small)}
 .alert{padding:12px;border-radius:8px;background:#1a3a1a;border:1px solid #2a5030;color:#7fc77f;margin-bottom:12px}
+.tabs{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid #2a3350;flex-wrap:wrap}
+.tab{flex:1;min-width:100px;padding:12px 16px;border:none;border-bottom:3px solid transparent;background:#111;color:#9aa7d1;font-weight:600;cursor:pointer;border-radius:8px 8px 0 0;transition:all .2s}
+.tab:hover{color:#f2f2f2;background:#1a1f2b}
+.tab.active{color:var(--brand);border-bottom-color:var(--brand);background:#0b0f1a}
+.tab-content{display:none;animation:fadeIn .3s}
+.tab-content.active{display:block}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
 </style></head><body>
 <div class="container">
   <div class="header"><div class="brand"></div><h1>Easylogger <span class="badge">%TITLE%</span></h1></div>
 
-  <form method="POST" action="/save" class="grid grid-2">
+  <div class="tabs">
+    <button type="button" class="tab active" onclick="switchTab('wifi')" id="tab-wifi">📶 Wi-Fi</button>
+    <button type="button" class="tab" onclick="switchTab('easylogger')" id="tab-easylogger">⚙️ Easylogger</button>
+    <button type="button" class="tab" onclick="switchTab('balance')" id="tab-balance">⚖️ Balance</button>
+    <button type="button" class="tab" onclick="switchTab('dac2')" id="tab-dac2">🔌 DAC2</button>
+    <button type="button" class="tab" onclick="switchTab('monitor')" id="tab-monitor">📺 Monitoring</button>
+  </div>
+
+  <form method="POST" action="/save" id="config-form">
   
+    <div id="tab-content-wifi" class="tab-content active">
     <div class="card">
       <h2>Connexion Wi-Fi (Client)</h2>
-      <label class="check"><input type="checkbox" name="autostamplc" id="autostamplc" %AUTOSTAMPLC_CHECK%> Connexion automatique au réseau <b>StamPLC</b></label>
-      <div class="meta">ℹ️ Si activé, l'AtomS3 se connectera automatiquement au même réseau que le StamPLC. <b>L'AtomS3 peut fonctionner de manière autonome sans le StamPLC</b> - en cas d'échec WiFi, il démarrera en mode AP (réseau Easylogger-XXXX).</div>
-      
-      <div id="stamplc_config" style="display:none;margin-top:1rem;">
-        <div class="row">
-          <div><label>SSID du réseau StamPLC</label><input name="stamplc_ssid" type="text" value="%STAMPLC_SSID%" placeholder="Wifi Unifi" maxlength="32"></div>
-          <div><label>Mot de passe</label><input name="stamplc_pass" type="password" value="%STAMPLC_PASS%" placeholder="Mot de passe" maxlength="64"></div>
-        </div>
-      </div>
-      
-      <hr style="margin:1rem 0;">
-      
-      <label class="check"><input type="checkbox" name="cli" %CLI_CHECK%> Activer le mode <b>Client Wi-Fi</b> (réseau personnalisé)</label>
-      <div class="meta">ℹ️ Utilisé uniquement si la connexion automatique StamPLC est désactivée. <b>Si aucune connexion WiFi ne fonctionne, l'AtomS3 démarrera automatiquement en mode AP (autonome)</b> - vous pourrez toujours accéder à l'interface web via le réseau "Easylogger-XXXX".</div>
+      <label class="check"><input type="checkbox" name="cli" %CLI_CHECK%> Activer le mode <b>Client Wi-Fi</b></label>
+      <div class="meta">ℹ️ Si aucune connexion WiFi ne fonctionne, l'AtomS3 démarrera en mode AP (réseau Easylogger-XXXX).</div>
 
       <div class="row">
         <div><label>SSID</label><input id="ssid" name="ssid" type="text" value="%SSID%" placeholder="Nom du réseau"></div>
         <div><label>Mot de passe</label><input id="pass" name="pass" type="password" value="%PASS%" placeholder="Mot de passe"></div>
       </div>
+      <div class="actions" style="margin-top:14px"><button class="btn" type="submit">💾 Enregistrer & redémarrer</button></div>
+    </div>
     </div>
 
+    <div id="tab-content-easylogger" class="tab-content">
     <div class="card">
       <h2>Réglages Easylogger</h2>
       <div class="grid grid-2">
@@ -598,8 +612,11 @@ hr{border:0;border-top:1px solid #2a3350;margin:12px 0}.footer{margin-top:22px;t
         <div><label>Taille police (1..3)</label><input name="font" type="number" min="1" max="3" value="%FONT%"></div>
         <div><label>Durée affichage (ms)</label><input name="showms" type="number" min="300" max="10000" value="%SHOWMS%"></div>
       </div>
+      <div class="actions" style="margin-top:14px"><button class="btn" type="submit">💾 Enregistrer & redémarrer</button></div>
+    </div>
     </div>
 
+    <div id="tab-content-balance" class="tab-content">
     <div class="card">
       <h2>Configuration Balance</h2>
       <div class="grid grid-2">
@@ -665,18 +682,47 @@ hr{border:0;border-top:1px solid #2a3350;margin:12px 0}.footer{margin-top:22px;t
           <label class="check"><input type="checkbox" name="swaprt" %SWAPRT%> Inverser RX et TX</label>
         </div>
       </div>
-      <hr style="margin:1rem 0;">
-      <div>
-        <label class="check"><input type="checkbox" name="stamplcmode" %STAMPLCMODE_CHECK%> Activer le <b>Mode StamPLC</b></label>
-        <div class="meta">ℹ️ Active le format de données normalisé pour le StamPLC. Les données seront formatées de manière cohérente peu importe le type de balance connectée (A&D ou Sartorius).</div>
-      </div>
       <div class="actions"><button class="btn" type="submit">💾 Enregistrer & redémarrer</button></div>
+    </div>
+    </div>
+
+    <div id="tab-content-dac2" class="tab-content">
+    <div class="card">
+      <h2>Sortie DAC2 (Unit DAC2 GP8413)</h2>
+      <div class="meta" style="margin-bottom:14px;">Convertisseur 15 bits I2C (0-10V). Convertit la pesée en tension proportionnelle avec étalonnage 6 points.</div>
+      <label class="check"><input type="checkbox" name="dac2en" %DAC2EN_CHECK%> Activer la <b>sortie DAC2</b></label>
+      
+      <div id="dac2_params" style="margin-top:1rem;">
+        <div class="row row-2">
+          <div><label>Plage début (g)</label><input name="dac2min" type="number" step="0.1" value="%DAC2MIN%" placeholder="0"></div>
+          <div><label>Plage fin (g)</label><input name="dac2max" type="number" step="0.1" value="%DAC2MAX%" placeholder="1000"></div>
+        </div>
+        <hr style="margin:1rem 0;">
+        <h3 style="font-size:14px;margin-bottom:10px;color:#cbd3ff;">Étalonnage 6 points (poids g → mV)</h3>
+        <div class="meta" style="margin-bottom:10px;">Saisir 6 paires (poids en g, tension en mV 0-10000) pour corriger les interférences. Interpolation linéaire entre les points.</div>
+        <div class="grid grid-2" style="gap:10px;">
+          <div><label>Pt 1 - Poids (g)</label><input name="dac2w0" type="number" step="0.01" value="%DAC2W0%"></div>
+          <div><label>Pt 1 - mV</label><input name="dac2m0" type="number" min="0" max="10000" value="%DAC2M0%"></div>
+          <div><label>Pt 2 - Poids (g)</label><input name="dac2w1" type="number" step="0.01" value="%DAC2W1%"></div>
+          <div><label>Pt 2 - mV</label><input name="dac2m1" type="number" min="0" max="10000" value="%DAC2M1%"></div>
+          <div><label>Pt 3 - Poids (g)</label><input name="dac2w2" type="number" step="0.01" value="%DAC2W2%"></div>
+          <div><label>Pt 3 - mV</label><input name="dac2m2" type="number" min="0" max="10000" value="%DAC2M2%"></div>
+          <div><label>Pt 4 - Poids (g)</label><input name="dac2w3" type="number" step="0.01" value="%DAC2W3%"></div>
+          <div><label>Pt 4 - mV</label><input name="dac2m3" type="number" min="0" max="10000" value="%DAC2M3%"></div>
+          <div><label>Pt 5 - Poids (g)</label><input name="dac2w4" type="number" step="0.01" value="%DAC2W4%"></div>
+          <div><label>Pt 5 - mV</label><input name="dac2m4" type="number" min="0" max="10000" value="%DAC2M4%"></div>
+          <div><label>Pt 6 - Poids (g)</label><input name="dac2w5" type="number" step="0.01" value="%DAC2W5%"></div>
+          <div><label>Pt 6 - mV</label><input name="dac2m5" type="number" min="0" max="10000" value="%DAC2M5%"></div>
+        </div>
+      </div>
+      <div class="actions" style="margin-top:14px"><button class="btn" type="submit">💾 Enregistrer</button></div>
+    </div>
     </div>
 
   </form>
 
-  <!-- Section Monitoring -->
-  <div class="card" style="margin-top:20px;">
+  <div id="tab-content-monitor" class="tab-content">
+  <div class="card">
     <h2>📺 Monitoring AtomS3</h2>
     
     <!-- Affichage de l'écran -->
@@ -709,11 +755,21 @@ hr{border:0;border-top:1px solid #2a3350;margin:12px 0}.footer{margin-top:22px;t
       </div>
     </div>
   </div>
+  </div>
 
   <div class="footer">Easylogger v2.1</div>
 </div>
 
 <script>
+function switchTab(tabId) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  const tabEl = document.getElementById('tab-' + tabId);
+  const contentEl = document.getElementById('tab-content-' + tabId);
+  if (tabEl) tabEl.classList.add('active');
+  if (contentEl) contentEl.classList.add('active');
+}
+
 const btype = document.getElementById('btype');
 
 function updateBalanceParams() {
@@ -748,20 +804,7 @@ function updateBalanceParams() {
   }
 }
 
-const autostamplc = document.getElementById('autostamplc');
-const stamplcConfig = document.getElementById('stamplc_config');
-
-function updateStamPLCVis() {
-  if (autostamplc && autostamplc.checked) {
-    if (stamplcConfig) stamplcConfig.style.display = 'block';
-  } else {
-    if (stamplcConfig) stamplcConfig.style.display = 'none';
-  }
-}
-
 btype.addEventListener('change', updateBalanceParams);
-if (autostamplc) autostamplc.addEventListener('change', updateStamPLCVis);
-if (autostamplc) updateStamPLCVis();
 
 // WebSocket pour le monitoring
 let ws = null;
@@ -934,12 +977,7 @@ String htmlIndex() {
   String h = PAGE_INDEX;
   h.replace("%TITLE%", cfg.title);
   
-  // WiFi - Connexion automatique StamPLC
-  h.replace("%AUTOSTAMPLC_CHECK%", cfg.autoConnectStamPLC ? "checked" : "");
-  h.replace("%STAMPLC_SSID%", cfg.stamplc_ssid);
-  h.replace("%STAMPLC_PASS%", cfg.stamplc_pass);
-  
-  // WiFi - Client personnalisé
+  // WiFi
   h.replace("%CLI_CHECK%", cfg.client_enabled ? "checked" : "");
   h.replace("%SSID%", cfg.ssid);
   h.replace("%PASS%", cfg.pass);
@@ -980,7 +1018,23 @@ String htmlIndex() {
   h.replace("%TERM_NONE%", (term.length()==0)?"selected":"");
   
   h.replace("%SWAPRT%", cfg.swapRxTx ? "checked" : "");
-  h.replace("%STAMPLCMODE_CHECK%", cfg.stamplcMode ? "checked" : "");
+  
+  // DAC2
+  h.replace("%DAC2EN_CHECK%", cfg.dac2_enabled ? "checked" : "");
+  h.replace("%DAC2MIN%", String(cfg.dac2_range_min, 1));
+  h.replace("%DAC2MAX%", String(cfg.dac2_range_max, 1));
+  h.replace("%DAC2W0%", String(cfg.dac2_cal_weight[0], 2));
+  h.replace("%DAC2M0%", String(cfg.dac2_cal_mv[0]));
+  h.replace("%DAC2W1%", String(cfg.dac2_cal_weight[1], 2));
+  h.replace("%DAC2M1%", String(cfg.dac2_cal_mv[1]));
+  h.replace("%DAC2W2%", String(cfg.dac2_cal_weight[2], 2));
+  h.replace("%DAC2M2%", String(cfg.dac2_cal_mv[2]));
+  h.replace("%DAC2W3%", String(cfg.dac2_cal_weight[3], 2));
+  h.replace("%DAC2M3%", String(cfg.dac2_cal_mv[3]));
+  h.replace("%DAC2W4%", String(cfg.dac2_cal_weight[4], 2));
+  h.replace("%DAC2M4%", String(cfg.dac2_cal_mv[4]));
+  h.replace("%DAC2W5%", String(cfg.dac2_cal_weight[5], 2));
+  h.replace("%DAC2M5%", String(cfg.dac2_cal_mv[5]));
   
   return h;
 }
@@ -1066,19 +1120,11 @@ void handleSave() {
   String s;
   
   // Sauvegarder les anciennes valeurs WiFi pour détecter les changements
-  bool oldAutoStamPLC = cfg.autoConnectStamPLC;
-  String oldStamPLCSSID = String(cfg.stamplc_ssid);
-  String oldStamPLCPass = String(cfg.stamplc_pass);
   bool oldClientEnabled = cfg.client_enabled;
   String oldSSID = String(cfg.ssid);
   String oldPass = String(cfg.pass);
   
-  // WiFi - Connexion automatique StamPLC
-  cfg.autoConnectStamPLC = server.hasArg("autostamplc");
-  s = server.arg("stamplc_ssid"); s.toCharArray(cfg.stamplc_ssid, sizeof(cfg.stamplc_ssid));
-  s = server.arg("stamplc_pass"); s.toCharArray(cfg.stamplc_pass, sizeof(cfg.stamplc_pass));
-  
-  // WiFi - Client personnalisé
+  // WiFi
   cfg.client_enabled = server.hasArg("cli");
   s = server.arg("ssid"); s.toCharArray(cfg.ssid, sizeof(cfg.ssid));
   s = server.arg("pass"); s.toCharArray(cfg.pass, sizeof(cfg.pass));
@@ -1088,9 +1134,6 @@ void handleSave() {
   s = server.arg("idle"); s.toCharArray(cfg.idleText, sizeof(cfg.idleText));
   cfg.fontMain = (uint8_t)constrain(server.arg("font").toInt(), 1, 3);
   cfg.showWeightMs = (uint32_t)constrain(server.arg("showms").toInt(), 300, 10000);
-  
-  // Mode StamPLC
-  cfg.stamplcMode = server.hasArg("stamplcmode");
   
   // Sauvegarder les anciennes valeurs Balance pour détecter les changements
   uint8_t oldBalanceType = cfg.balanceType;
@@ -1131,6 +1174,19 @@ void handleSave() {
     cfg.swapRxTx = server.hasArg("swaprt");
   }
   
+  // DAC2
+  cfg.dac2_enabled = server.hasArg("dac2en");
+  cfg.dac2_range_min = server.arg("dac2min").toFloat();
+  cfg.dac2_range_max = server.arg("dac2max").toFloat();
+  for (int i = 0; i < 6; i++) {
+    char nw[16], nm[16];
+    snprintf(nw, sizeof(nw), "dac2w%d", i);
+    snprintf(nm, sizeof(nm), "dac2m%d", i);
+    cfg.dac2_cal_weight[i] = server.arg(nw).toFloat();
+    cfg.dac2_cal_mv[i] = (uint16_t)constrain(server.arg(nm).toInt(), 0, 10000);
+  }
+  if (cfg.dac2_range_max <= cfg.dac2_range_min) cfg.dac2_range_max = cfg.dac2_range_min + 1.0f;
+  
   // Terminator - seulement si on n'a pas déjà appliqué les paramètres Sartorius
   if (!(newBalanceType == (uint8_t)BalanceType::Sartorius && oldBalanceType != (uint8_t)BalanceType::Sartorius)) {
     s = server.arg("terminator");
@@ -1150,10 +1206,7 @@ void handleSave() {
   }
   
   // Détecter si les paramètres WiFi ont changé
-  bool wifiChanged = (oldAutoStamPLC != cfg.autoConnectStamPLC) ||
-                     (oldStamPLCSSID != String(cfg.stamplc_ssid)) ||
-                     (oldStamPLCPass != String(cfg.stamplc_pass)) ||
-                     (oldClientEnabled != cfg.client_enabled) ||
+  bool wifiChanged = (oldClientEnabled != cfg.client_enabled) ||
                      (oldSSID != String(cfg.ssid)) ||
                      (oldPass != String(cfg.pass));
   
@@ -1169,6 +1222,23 @@ void handleSave() {
   
   // Sauvegarder la configuration
   saveConfig();
+  
+  // Réinitialiser DAC2 si paramètres modifiés
+  if (cfg.dac2_enabled) {
+    if (g_dac2.begin() == 0) {
+      g_dac2.setDACOutRange(g_dac2.eOutputRange10V);
+      dac2Ok = true;
+      Serial.println("[DAC2] Réinitialisé");
+    } else {
+      dac2Ok = false;
+    }
+  } else {
+    if (dac2Ok) {
+      g_dac2.setDACOutVoltage(0, 0);
+      g_dac2.setDACOutVoltage(0, 1);
+    }
+    dac2Ok = false;
+  }
   
   if (wifiChanged) {
     // Les paramètres WiFi ont changé -> redémarrage nécessaire
@@ -1308,6 +1378,12 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
   }
 }
 
+// Répond à la sonde Windows NCSI (connecttest.txt) pour éviter les 404 répétés
+void handleConnectTest() {
+  sendCORS();
+  server.send(200, "text/plain", "Microsoft Connect Test");
+}
+
 void handleNotFound() {
   Serial.printf("[HTTP] 404 Not Found: %s from %s\n", 
                server.uri().c_str(), 
@@ -1335,6 +1411,8 @@ void handleTest() {
 void setupWeb() {
   // Endpoint de test simple pour vérifier que le serveur répond
   server.on("/test", HTTP_GET, handleTest);
+  // Sonde Windows NCSI - évite les 404 répétés dans les logs
+  server.on("/connecttest.txt", HTTP_GET, handleConnectTest);
   
   server.on("/", HTTP_GET, handleRoot);
   server.on("/save", HTTP_POST, handleSave);
@@ -1462,6 +1540,50 @@ void drawWeightScreen(const String& raw) {
   currentScreenContent = raw;
 }
 
+// Extraire la valeur numérique (g) depuis "123.45 g", "N 0.0 g", "+ 12.34 g"
+float parseWeightGrams(const String& s) {
+  int start = -1, end = -1;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s.charAt(i);
+    bool isNum = (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '+' || c == ',';
+    if (isNum && start < 0) start = (int)i;
+    if (start >= 0 && !isNum) { end = (int)i; break; }
+    if (start >= 0 && i == s.length() - 1) end = (int)i + 1;
+  }
+  if (start < 0) return 0.0f;
+  if (end < 0) end = (int)s.length();
+  String t = s.substring(start, end);
+  t.replace(",", ".");
+  return t.toFloat();
+}
+
+// Convertir poids (g) en mV via calibration 6 points (interpolation linéaire par segments)
+uint16_t weightToDacMv(float weightG) {
+  if (weightG < cfg.dac2_range_min) return cfg.dac2_cal_mv[0];
+  if (weightG > cfg.dac2_range_max) return cfg.dac2_cal_mv[5];
+  if (weightG <= cfg.dac2_cal_weight[0]) return cfg.dac2_cal_mv[0];
+  if (weightG >= cfg.dac2_cal_weight[5]) return cfg.dac2_cal_mv[5];
+  for (int i = 0; i < 5; i++) {
+    if (weightG >= cfg.dac2_cal_weight[i] && weightG <= cfg.dac2_cal_weight[i + 1]) {
+      float w0 = cfg.dac2_cal_weight[i], w1 = cfg.dac2_cal_weight[i + 1];
+      float m0 = (float)cfg.dac2_cal_mv[i], m1 = (float)cfg.dac2_cal_mv[i + 1];
+      if (w1 <= w0) return cfg.dac2_cal_mv[i];
+      float t = (weightG - w0) / (w1 - w0);
+      return (uint16_t)(m0 + t * (m1 - m0));
+    }
+  }
+  return cfg.dac2_cal_mv[0];
+}
+
+void setDac2Output(uint16_t mv) {
+  if (!dac2Ok || !cfg.dac2_enabled) return;
+  if (mv > 10000) mv = 10000;
+  uint16_t dacVal = (uint32_t)mv * 32767UL / 10000UL;
+  if (dacVal > 32767) dacVal = 32767;
+  g_dac2.setDACOutVoltage(dacVal, 0);
+  g_dac2.setDACOutVoltage(dacVal, 1);
+}
+
 String parseBalanceResponse(const String& raw) {
   String cleaned = raw;
   cleaned.replace("\r", "");
@@ -1483,65 +1605,6 @@ String parseBalanceResponse(const String& raw) {
   return cleaned;
 }
 
-// Formater les données pour le StamPLC (format normalisé)
-String formatForStamPLC(const String& rawWeight) {
-  String formatted = rawWeight;
-  formatted.trim();
-  
-  // Supprimer les préfixes de statut de la balance (N, G, T, S, etc.)
-  // Ces préfixes indiquent l'état de la balance mais ne sont pas nécessaires pour le StamPLC
-  // Exemples: "N 0.0 g" -> "0.0 g", "N + 0.1 g" -> "+0.1 g", "G 123.45 g" -> "123.45 g"
-  
-  // Liste des préfixes à supprimer (séparés par des espaces)
-  String prefixes[] = {"N ", "G ", "T ", "S ", "O ", "U ", "L ", "H ", "+N ", "-N ", "+G ", "-G "};
-  
-  // Supprimer les préfixes
-  for (int i = 0; i < sizeof(prefixes)/sizeof(prefixes[0]); i++) {
-    if (formatted.startsWith(prefixes[i])) {
-      formatted = formatted.substring(prefixes[i].length());
-      break;
-    }
-  }
-  
-  // Si le format commence par "N" seul (sans espace), le supprimer aussi
-  if (formatted.length() > 0 && formatted.charAt(0) == 'N' && 
-      (formatted.length() == 1 || formatted.charAt(1) == ' ')) {
-    if (formatted.length() > 1) {
-      formatted = formatted.substring(1);
-    } else {
-      formatted = "";
-    }
-  }
-  
-  formatted.trim();
-  
-  // Nettoyer les espaces multiples et garder uniquement la valeur avec l'unité
-  String result = "";
-  bool lastWasSpace = false;
-  for (size_t i = 0; i < formatted.length(); i++) {
-    char c = formatted.charAt(i);
-    if (c == ' ') {
-      if (!lastWasSpace && result.length() > 0) {
-        // Garder un seul espace si nécessaire
-        result += ' ';
-        lastWasSpace = true;
-      }
-    } else if (isprint(c) || c == '+' || c == '-' || c == '.' || c == ',') {
-      result += c;
-      lastWasSpace = false;
-    }
-  }
-  
-  result.trim();
-  
-  // Si vide après nettoyage, retourner le format original
-  if (result.length() == 0) {
-    return rawWeight;
-  }
-  
-  return result;
-}
-
 // ===== Setup =====
 void setup() {
   Serial.begin(115200);
@@ -1552,12 +1615,9 @@ void setup() {
   loadConfig();
 
   Serial.printf("\n\n=== Easylogger v2.0 ===\n");
-  Serial.printf("Auto-connexion StamPLC: %s\n", cfg.autoConnectStamPLC ? "OUI" : "NON");
-  Serial.println("ℹ️  L'AtomS3 peut fonctionner de manière autonome sans le StamPLC");
-  Serial.println("ℹ️  En cas d'échec WiFi, il démarrera en mode AP (réseau Easylogger-XXXX)");
+  Serial.println("ℹ️  En cas d'échec WiFi, l'AtomS3 démarrera en mode AP (réseau Easylogger-XXXX)");
   
-  // Essayer WiFi client (StamPLC auto ou personnalisé), sinon AP
-  // L'AtomS3 fonctionne de manière autonome même sans réseau WiFi (mode AP)
+  // Essayer WiFi client, sinon AP
   bool sta = startClientWiFi();
   if (!sta) {
     Serial.println("[WiFi] Démarrage en mode AP (autonome)");
@@ -1597,6 +1657,19 @@ void setup() {
   if (cfg.balanceType == (uint8_t)BalanceType::Sartorius) {
     delay(1000); // Attendre que Serial2 soit complètement initialisé
     initSartoriusContinuous();
+  }
+
+  // Initialiser DAC2 (Unit DAC2 GP8413) si activé
+  if (cfg.dac2_enabled) {
+    if (g_dac2.begin() == 0) {
+      g_dac2.setDACOutRange(g_dac2.eOutputRange10V);
+      g_dac2.setDACOutVoltage(0, 0);
+      g_dac2.setDACOutVoltage(0, 1);
+      dac2Ok = true;
+      Serial.println("[DAC2] GP8413 OK - Plage 0-10V, 15 bits");
+    } else {
+      Serial.println("[DAC2] Init échec - Vérifier le câblage I2C (Unit DAC2)");
+    }
   }
 
   drawIdleScreen();
@@ -1694,35 +1767,14 @@ void loop() {
           uint8_t clients = webSocket.connectedClients();
           if (clients > 0) {
             char json[128];
-            const char* weightToSend = cleaned.c_str();
-            char formattedWeight[64] = {0};
-            
-            // Si le mode StamPLC est activé, formater les données (optimisé inline)
-            if (cfg.stamplcMode) {
-              const char* src = cleaned.c_str();
-              int dstIdx = 0;
-              // Supprimer les préfixes rapidement
-              if (src[0] == 'N' && src[1] == ' ') {
-                src += 2;
-              } else if (src[0] == 'G' && src[1] == ' ') {
-                src += 2;
-              }
-              while (*src && dstIdx < sizeof(formattedWeight) - 1) {
-                formattedWeight[dstIdx++] = *src++;
-              }
-              formattedWeight[dstIdx] = '\0';
-              weightToSend = formattedWeight;
-            }
-            
-            // Envoyer la pesée immédiatement
-            snprintf(json, sizeof(json), "{\"weight\":\"%s\"}", weightToSend);
+            snprintf(json, sizeof(json), "{\"weight\":\"%s\"}", cleaned.c_str());
             webSocket.broadcastTXT(json);
             
             // Mettre à jour l'écran AtomS3 dans l'interface web IMMÉDIATEMENT
             char screenJson[128];
             snprintf(screenJson, sizeof(screenJson), 
                      "{\"type\":\"screen\",\"mode\":\"weight\",\"content\":\"%s\"}",
-                     weightToSend);
+                     cleaned.c_str());
             webSocket.broadcastTXT(screenJson);
             
             // Forcer l'envoi immédiat en appelant loop() plusieurs fois
@@ -1736,6 +1788,13 @@ void loop() {
           if (millis() - lastScreenDraw > 50) { // 20 FPS max pour l'écran physique
             drawWeightScreen(lastWeight);
             lastScreenDraw = millis();
+          }
+          
+          // Sortie DAC2 si activé
+          if (cfg.dac2_enabled && dac2Ok) {
+            float wg = parseWeightGrams(cleaned);
+            uint16_t mv = weightToDacMv(wg);
+            setDac2Output(mv);
           }
           
           // Logger terminal seulement si demandé
@@ -1787,39 +1846,27 @@ void loop() {
       uint8_t clients = webSocket.connectedClients();
       if (clients > 0) {
         char json[128];
-        const char* weightToSend = cleaned.c_str();
-        char formattedWeight[64] = {0};
-        
-        if (cfg.stamplcMode) {
-          const char* src = cleaned.c_str();
-          int dstIdx = 0;
-          if (src[0] == 'N' && src[1] == ' ') {
-            src += 2;
-          } else if (src[0] == 'G' && src[1] == ' ') {
-            src += 2;
-          }
-          while (*src && dstIdx < sizeof(formattedWeight) - 1) {
-            formattedWeight[dstIdx++] = *src++;
-          }
-          formattedWeight[dstIdx] = '\0';
-          weightToSend = formattedWeight;
-        }
-        
-        // Envoyer la pesée immédiatement
-        snprintf(json, sizeof(json), "{\"weight\":\"%s\"}", weightToSend);
+        snprintf(json, sizeof(json), "{\"weight\":\"%s\"}", cleaned.c_str());
         webSocket.broadcastTXT(json);
         
         // Mettre à jour l'écran AtomS3 dans l'interface web IMMÉDIATEMENT
         char screenJson[128];
         snprintf(screenJson, sizeof(screenJson), 
                  "{\"type\":\"screen\",\"mode\":\"weight\",\"content\":\"%s\"}",
-                 weightToSend);
+                 cleaned.c_str());
         webSocket.broadcastTXT(screenJson);
         
         // Forcer l'envoi immédiat en appelant loop() plusieurs fois
         webSocket.loop();
         webSocket.loop();
         webSocket.loop();
+      }
+      
+      // Sortie DAC2 si activé (timeout)
+      if (cfg.dac2_enabled && dac2Ok) {
+        float wg = parseWeightGrams(cleaned);
+        uint16_t mv = weightToDacMv(wg);
+        setDac2Output(mv);
       }
       
       // Mise à jour écran physique limitée
