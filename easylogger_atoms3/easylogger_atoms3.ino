@@ -12,8 +12,10 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <WebServer.h>
-#include <WebSocketsServer.h>
+#include <WebSockets2_Generic.h>
 #include <WiFi.h>
+
+using namespace websockets2_generic;
 #include <Wire.h>
 #include <time.h>
 
@@ -35,6 +37,16 @@ float getCoreTemp() {
   float tsens_out;
   temperature_sensor_get_celsius(temp_sensor, &tsens_out);
   return tsens_out;
+}
+
+// Batterie ESP32-S3 (M5AtomS3 Power_Class — M5Unified)
+// Retourne 0-100 ou -1 si non disponible (ex. alimentation USB sans batterie)
+int8_t getBatteryLevel() {
+  return (int8_t)AtomS3.Power.getBatteryLevel();
+}
+bool isBatteryCharging() {
+  // is_charging_t: 0=discharging, 1=charging, 2=unknown
+  return (AtomS3.Power.isCharging() == 1);
 }
 
 // Estimation Charge CPU (basée sur le temps de boucle)
@@ -77,6 +89,8 @@ enum class BalanceType { AandD = 0, Sartorius = 1 };
 static const uint32_t IDLE_REFRESH_MS = 1000;
 const char *TZ_EUROPE_PARIS = "CET-1CEST,M3.5.0/2,M10.5.0/3";
 #define COL_GRAY 0x7BEF
+#define COL_STABLE 0x03C0    // Vert foncé (ST)
+#define COL_UNSTABLE 0xFD20  // Orange foncé (US)
 
 // -------- Buffers --------
 char lineBuf[64];
@@ -105,6 +119,10 @@ struct AppConfig {
   bool showWifiIndicator = true;
   uint8_t dtFormat = 0;
   char unit[10] = "KG"; // Unité par défaut
+  bool weightColorByStability = false;  // Vert si valeur identique pendant X s
+  uint32_t weightStabilityMs = 2000;   // Durée (ms) sans changement → stable (vert)
+  bool weightHideLeadingZeros = false;  // +00066,20g -> 66,20g
+  bool weightShowPlusSign = true;       // Afficher + ou seulement -
 
   // Balance - Par défaut : A&D, 2400, 7E1, CRLF, contrôle flux aucun
   uint8_t balanceType = 0; // 0=A&D, 1=Sartorius
@@ -134,7 +152,31 @@ bool dac2Ok = false;
 
 Preferences prefs;
 WebServer server(80);
-WebSocketsServer webSocket(81); // Port 81 pour WebSocket
+
+// -------- WebSocket (WebSockets2_Generic, basé sur ArduinoWebsockets) --------
+#define WS_MAX_CLIENTS 4
+WebsocketsServer wsServer;
+WebsocketsClient wsClients[WS_MAX_CLIENTS];
+bool wsClientInUse[WS_MAX_CLIENTS] = {false};
+
+static uint8_t wsConnectedCount() {
+  uint8_t n = 0;
+  for (int i = 0; i < WS_MAX_CLIENTS; i++)
+    if (wsClientInUse[i] && wsClients[i].available())
+      n++;
+  return n;
+}
+static void wsBroadcastTXT(const char* txt) {
+  for (int i = 0; i < WS_MAX_CLIENTS; i++)
+    if (wsClientInUse[i] && wsClients[i].available())
+      wsClients[i].send(txt);
+}
+static void wsSendTXT(uint8_t num, const char* txt) {
+  if (num < WS_MAX_CLIENTS && wsClientInUse[num] && wsClients[num].available())
+    wsClients[num].send(txt);
+}
+static void wsLoop();
+
 DNSServer dnsServer;
 const byte DNS_PORT = 53;
 bool dnsRunning = false;
@@ -153,7 +195,12 @@ bool wifiOK = false, timeReady = false;
 
 String lastWeight = "";
 uint32_t lastWeightMs = 0;
+String lastDisplayedValue = "";        // Toujours la valeur formatée (sans ST/US) pour affichage
+String lastFormattedValue = "";        // Pour calcul stabilité (durée identique)
+uint32_t lastFormattedValueSince = 0;  // millis() quand cette valeur est apparue
+uint32_t lastScreenSendMs = 0;         // Throttle envoi écran WebSocket (20 Hz max)
 uint16_t lastDacMv = 0; // Dernière valeur envoyée au DAC (mV), pour affichage web
+static const uint32_t SCREEN_SEND_INTERVAL_MS = 50;  // 20 Hz max pour écran (20 pesées/s)
 
 // Variables pour le monitoring (terminal + écran)
 String currentScreenContent = "";   // Contenu actuel de l'écran
@@ -289,7 +336,7 @@ String getBalanceCommand() {
 // Fonction pour ajouter une ligne au terminal (ultra-optimisée pour 20Hz)
 void addTerminalLog(const String &direction, const String &data) {
   // Vérification rapide - si pas de clients, on sort immédiatement
-  if (webSocket.connectedClients() == 0) {
+  if (wsConnectedCount() == 0) {
     return;
   }
 
@@ -332,7 +379,14 @@ void addTerminalLog(const String &direction, const String &data) {
   snprintf(json, sizeof(json),
            "{\"type\":\"terminal\",\"direction\":\"%s\",\"data\":\"%s\"}",
            direction.c_str(), escapedData);
-  webSocket.broadcastTXT(json);
+  wsBroadcastTXT(json);
+}
+
+// Retourne true si la valeur affichée est stable (identique depuis weightStabilityMs)
+bool isWeightStable() {
+  if (lastFormattedValue.length() == 0) return false;
+  if (lastDisplayedValue != lastFormattedValue) return false;
+  return (millis() - lastFormattedValueSince) >= cfg.weightStabilityMs;
 }
 
 // Fonction pour mettre à jour l'état de l'écran
@@ -343,24 +397,31 @@ void updateScreenState() {
     currentScreenContent = cfg.idleText;
   } else if (uiMode == UiMode::ShowWeight) {
     currentScreenMode = "weight";
-    currentScreenContent = lastWeight;
+    currentScreenContent = lastDisplayedValue;  // Toujours formatée, jamais ST/US
   } else {
     currentScreenMode = "other";
     currentScreenContent = "";
   }
 
   // Envoyer via WebSocket si connecté
-  uint8_t clients = webSocket.connectedClients();
+  uint8_t clients = wsConnectedCount();
   if (clients > 0) {
-    char json[256];
+    char json[280];
     String escapedContent = currentScreenContent;
     escapedContent.replace("\\", "\\\\");
     escapedContent.replace("\"", "\\\"");
 
-    snprintf(json, sizeof(json),
-             "{\"type\":\"screen\",\"mode\":\"%s\",\"content\":\"%s\"}",
-             currentScreenMode.c_str(), escapedContent.c_str());
-    webSocket.broadcastTXT(json);
+    if (currentScreenMode == "weight" && cfg.weightColorByStability) {
+      bool st = isWeightStable();
+      snprintf(json, sizeof(json),
+               "{\"type\":\"screen\",\"mode\":\"weight\",\"content\":\"%s\",\"stable\":%s}",
+               escapedContent.c_str(), st ? "true" : "false");
+    } else {
+      snprintf(json, sizeof(json),
+               "{\"type\":\"screen\",\"mode\":\"%s\",\"content\":\"%s\"}",
+               currentScreenMode.c_str(), escapedContent.c_str());
+    }
+    wsBroadcastTXT(json);
   }
 }
 
@@ -431,6 +492,10 @@ void saveConfig() {
   prefs.putBool("wifiind", cfg.showWifiIndicator);
   prefs.putUChar("dtfmt", cfg.dtFormat);
   prefs.putString("unit", cfg.unit);
+  prefs.putBool("wcolorst", cfg.weightColorByStability);
+  prefs.putUInt("wstabms", cfg.weightStabilityMs);
+  prefs.putBool("whidez", cfg.weightHideLeadingZeros);
+  prefs.putBool("wplus", cfg.weightShowPlusSign);
   // Balance
   prefs.putUChar("btype", cfg.balanceType);
   prefs.putUInt("bbaud", cfg.balanceBaud);
@@ -480,6 +545,10 @@ void loadConfig() {
   cfg.dtFormat = prefs.getUChar("dtfmt", (uint8_t)legacy);
   s = prefs.getString("unit", "KG");
   s.toCharArray(cfg.unit, sizeof(cfg.unit));
+  cfg.weightColorByStability = prefs.getBool("wcolorst", false);
+  cfg.weightStabilityMs = prefs.getUInt("wstabms", 2000);
+  cfg.weightHideLeadingZeros = prefs.getBool("whidez", false);
+  cfg.weightShowPlusSign = prefs.getBool("wplus", true);
   // Balance
   cfg.balanceType = prefs.getUChar("btype", 0);
 
@@ -525,6 +594,7 @@ void loadConfig() {
   cfg.dtFormat = constrain(cfg.dtFormat, (uint8_t)0, (uint8_t)7);
   if (cfg.showWeightMs < 300)
     cfg.showWeightMs = 300;
+  cfg.weightStabilityMs = constrain(cfg.weightStabilityMs, (uint32_t)500, (uint32_t)30000);
   cfg.balanceType = constrain(cfg.balanceType, (uint8_t)0, (uint8_t)1);
   if (cfg.balanceBaud < 600)
     cfg.balanceBaud = 2400;
@@ -747,6 +817,10 @@ String htmlIndex() {
   h.replace("%DTFMT6%", (cfg.dtFormat == 6) ? "selected" : "");
   h.replace("%DTFMT7%", (cfg.dtFormat == 7) ? "selected" : "");
   h.replace("%WIFIIND_CHECK%", cfg.showWifiIndicator ? "checked" : "");
+  h.replace("%WCOLORST_CHECK%", cfg.weightColorByStability ? "checked" : "");
+  h.replace("%WSTABMS%", String(cfg.weightStabilityMs / 1000));
+  h.replace("%WHIDEZ_CHECK%", cfg.weightHideLeadingZeros ? "checked" : "");
+  h.replace("%WPLUS_CHECK%", cfg.weightShowPlusSign ? "checked" : "");
 
   // Balance
   h.replace("%BTYPE0%", (cfg.balanceType == 0) ? "selected" : "");
@@ -836,7 +910,7 @@ void applyUISettings() {
   if (uiMode == UiMode::IdleClock) {
     drawIdleScreen();
   } else if (uiMode == UiMode::ShowWeight) {
-    drawWeightScreen(lastWeight);
+    drawWeightScreen(lastDisplayedValue);
   }
 
   // Mettre à jour l'état pour l'interface web
@@ -922,6 +996,11 @@ void handleSave() {
   s.toCharArray(cfg.unit, sizeof(cfg.unit));
   cfg.dtFormat = (uint8_t)constrain(server.arg("dtfmt").toInt(), 0, 7);
   cfg.showWifiIndicator = server.hasArg("wifiind");
+  cfg.weightColorByStability = server.hasArg("wcolorst");
+  int stabSec = constrain(server.arg("wstabms").toInt(), 1, 30);
+  cfg.weightStabilityMs = (uint32_t)stabSec * 1000;
+  cfg.weightHideLeadingZeros = server.hasArg("whidez");
+  cfg.weightShowPlusSign = server.hasArg("wplus");
 
   // Sauvegarder les anciennes valeurs Balance pour détecter les changements
   uint8_t oldBalanceType = cfg.balanceType;
@@ -1026,13 +1105,14 @@ void handleSave() {
       g_dac2.setDACOutRange(g_dac2.eOutputRange10V);
       dac2Ok = true;
       Serial.println("[DAC2] Activé et réinitialisé");
-      // Appliquer immédiatement le poids actuel à la sortie DAC
+      // Appliquer immédiatement le poids actuel à la sortie DAC (valeur nettoyée)
       if (lastWeight.length() > 0) {
-        float wg = parseWeightGrams(lastWeight);
+        String forDac = getWeightStringForDac(lastWeight);
+        float wg = parseWeightGrams(forDac);
         uint16_t mv = weightToDacMv(wg);
         setDac2Output(mv);
         Serial.printf("[DAC2] Sortie appliquée: %s -> %u mV\n",
-                      lastWeight.c_str(), lastDacMv);
+                      forDac.c_str(), lastDacMv);
       } else {
         setDac2Output(0);
       }
@@ -1089,7 +1169,7 @@ void handleStatus() {
   snprintf(json, sizeof(json),
            "{\"lastWeight\":\"%s\",\"now\":\"%s\",\"balanceType\":\"%s\","
            "\"baudRate\":%lu}",
-           lastWeight.c_str(), nowStr.c_str(), balanceTypeStr, cfg.balanceBaud);
+           lastDisplayedValue.c_str(), nowStr.c_str(), balanceTypeStr, cfg.balanceBaud);
   server.send(200, "application/json", json);
 }
 
@@ -1163,54 +1243,71 @@ void handleMonitor() {
   json += "\"cpu\":" + String(cpuLoad, 0) + ",";
   json += "\"heap\":" + String(ESP.getFreeHeap() / 1024); // ko
 
-  // Poids et DAC pour page paramètres DAC
-  String escWeight = lastWeight;
-  escWeight.replace("\\", "\\\\");
-  escWeight.replace("\"", "\\\"");
-  json += ",\"weight\":\"" + escWeight + "\"";
+  // Poids actuel DAC2 : toujours valeur nettoyée (jamais ST/US), fallback si lastDisplayedValue vide
+  String weightForDacDisplay = lastDisplayedValue.length() > 0
+                                   ? lastDisplayedValue
+                                   : formatWeightForDisplay(lastWeight);
+  weightForDacDisplay.replace("\\", "\\\\");
+  weightForDacDisplay.replace("\"", "\\\"");
+  json += ",\"weight\":\"" + weightForDacDisplay + "\"";
   json += ",\"dacMv\":" + String(lastDacMv);
-
+  int8_t bat = getBatteryLevel();
+  json += ",\"battery\":" + String((int)bat);
+  json += ",\"charging\":" + String(isBatteryCharging() ? "true" : "false");
+  if (currentScreenMode == "weight" && cfg.weightColorByStability) {
+    json += ",\"stable\":";
+    json += isWeightStable() ? "true" : "false";
+  }
   json += "}";
   server.send(200, "application/json", json);
 }
 
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t *payload,
-                    size_t length) {
-  switch (type) {
-  case WStype_DISCONNECTED:
-    Serial.printf("[WS] ⚠️  Client #%u déconnecté\n", num);
-    break;
-  case WStype_CONNECTED: {
-    char clientInfo[64];
-    if (length > 0 && length < sizeof(clientInfo)) {
-      memcpy(clientInfo, payload, length);
-      clientInfo[length] = '\0';
-      Serial.printf("[WS] ✅ Client #%u connecté depuis %s\n", num, clientInfo);
-    } else {
-      Serial.printf("[WS] ✅ Client #%u connecté\n", num);
-    }
-    // Envoyer la dernière valeur immédiatement
-    if (lastWeight.length() > 0) {
-      char json[128];
-      String nowStr = nowDateTime();
-      snprintf(json, sizeof(json), "{\"weight\":\"%s\",\"timestamp\":\"%s\"}",
-               lastWeight.c_str(), nowStr.c_str());
-      webSocket.sendTXT(num, json);
-      Serial.printf("[WS] 📤 Envoi dernière pesée au client #%u: %s\n", num,
-                    lastWeight.c_str());
-    } else {
-      Serial.printf("[WS] ℹ️  Pas de dernière pesée à envoyer au client #%u\n",
-                    num);
-    }
-    break;
+static void wsLoop() {
+  // Accepter un nouveau client (accept() retourne un client si une connexion est en attente)
+  {
+    WebsocketsClient client = wsServer.accept();
+    if (client.available()) {
+        int slot = -1;
+        for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+          if (!wsClientInUse[i]) {
+            slot = i;
+            break;
+          }
+        }
+        if (slot >= 0) {
+          wsClients[slot] = client;
+          wsClientInUse[slot] = true;
+          const int idx = slot;
+          wsClients[slot].onEvent([idx](WebsocketsEvent e, String d) {
+            if (e == WebsocketsEvent::ConnectionClosed)
+              wsClientInUse[idx] = false;
+          });
+          wsClients[slot].onMessage([](WebsocketsMessage msg) {
+            Serial.printf("[WS] 📨 Message reçu: %s\n", msg.data().c_str());
+          });
+          Serial.printf("[WS] ✅ Client #%d connecté\n", slot);
+          if (lastDisplayedValue.length() > 0) {
+            char json[128];
+            String nowStr = nowDateTime();
+            snprintf(json, sizeof(json),
+                     "{\"weight\":\"%s\",\"timestamp\":\"%s\"}",
+                     lastDisplayedValue.c_str(), nowStr.c_str());
+            wsSendTXT((uint8_t)slot, json);
+            Serial.printf("[WS] 📤 Envoi dernière pesée au client #%d\n",
+                          slot);
+          }
+        }
+      }
   }
-  case WStype_TEXT:
-    Serial.printf("[WS] 📨 Message reçu du client #%u: %.*s\n", num, length,
-                  payload);
-    break;
-  default:
-    Serial.printf("[WS] ℹ️  Événement type %d du client #%u\n", type, num);
-    break;
+  // Poll tous les clients connectés
+  for (int i = 0; i < WS_MAX_CLIENTS; i++) {
+    if (wsClientInUse[i]) {
+      wsClients[i].poll();
+      if (!wsClients[i].available()) {
+        wsClientInUse[i] = false;
+        Serial.printf("[WS] ⚠️  Client #%d déconnecté\n", i);
+      }
+    }
   }
 }
 
@@ -1272,9 +1369,8 @@ void setupWeb() {
   Serial.println("[HTTP] Server started on port 80");
   Serial.println("[HTTP] Test endpoint: http://<IP>/test");
 
-  // Démarrer le serveur WebSocket
-  webSocket.begin();
-  webSocket.onEvent(webSocketEvent);
+  // Démarrer le serveur WebSocket (WebSockets2_Generic)
+  wsServer.listen(81);
   Serial.println("[WS] WebSocket server started on port 81");
 }
 
@@ -1359,25 +1455,74 @@ void drawIdleScreen() {
   // Mettre à jour l'état pour l'interface web (seulement si des clients sont
   // connectés)
   static uint32_t lastScreenUpdate = 0;
-  if (webSocket.connectedClients() > 0 && (millis() - lastScreenUpdate > 500)) {
+  if (wsConnectedCount() > 0 && (millis() - lastScreenUpdate > 500)) {
     updateScreenState();
     lastScreenUpdate = millis();
   }
 }
 
-void drawWeightScreen(const String &raw) {
+// Formate la valeur poids pour l'affichage : retire toujours ST,/US, (non affichés),
+// masque zéros non significatifs, option signe +
+String formatWeightForDisplay(const String &raw) {
+  String out = raw;
+  if (out.startsWith("ST,") || out.startsWith("ST "))
+    out = out.substring(3);
+  else if (out.startsWith("US,") || out.startsWith("US "))
+    out = out.substring(3);
+  if (cfg.weightHideLeadingZeros) {
+    int i = 0;
+    if (out.length() > 0 && (out.charAt(0) == '+' || out.charAt(0) == '-'))
+      i = 1;
+    while (i < out.length() && out.charAt(i) == '0' && i + 1 < out.length() &&
+           out.charAt(i + 1) != '.' && out.charAt(i + 1) != ',')
+      i++;
+    if (i > 0 && (out.charAt(0) == '+' || out.charAt(0) == '-'))
+      out = out.substring(0, 1) + out.substring(i);
+    else if (i > 0)
+      out = out.substring(i);
+  }
+  if (!cfg.weightShowPlusSign && out.length() > 0 && out.charAt(0) == '+')
+    out = out.substring(1);
+  return out;
+}
+
+void drawWeightScreen(const String &displayOrRaw) {
   auto &d = AtomS3.Display;
   d.clear();
   drawHeader();
   drawIP();
-  drawMainCentered(raw, WHITE);
+  // Reformat au cas où on reçoit du brut ; si déjà formaté (pas de ST,/US,) inchangé
+  String displayStr = formatWeightForDisplay(displayOrRaw);
+  uint16_t color = WHITE;
+  if (cfg.weightColorByStability) {
+    color = isWeightStable() ? COL_STABLE : COL_UNSTABLE;
+  }
+  drawMainCentered(displayStr, color);
+  // Sous le poids : tension DAC (mV) si DAC2 activé
+  if (cfg.dac2_enabled) {
+    char dacStr[24];
+    snprintf(dacStr, sizeof(dacStr), "%u mV", lastDacMv);
+    d.setTextDatum(middle_center);
+    d.setTextColor(CYAN);
+    d.setTextSize(1);
+    d.drawString(dacStr, d.width() / 2, d.height() / 2 + 20);
+  }
   drawDateTime();
   drawWifiIndicator();
 
-  // Mise à jour de l'état (mais l'envoi WebSocket se fait déjà dans la boucle
-  // principale)
   currentScreenMode = "weight";
-  currentScreenContent = raw;
+  currentScreenContent = displayStr;
+}
+
+// Retourne la valeur nettoyée pour le DAC (sans préfixe ST,/US,) — à utiliser
+// uniquement pour parseWeightGrams / DAC, pas pour l'affichage.
+String getWeightStringForDac(const String &cleaned) {
+  String out = cleaned;
+  if (out.startsWith("ST,") || out.startsWith("ST "))
+    out = out.substring(3);
+  else if (out.startsWith("US,") || out.startsWith("US "))
+    out = out.substring(3);
+  return out;
 }
 
 // Extraire la valeur numérique (g) depuis "123.45 g", "N 0.0 g", "+ 12.34 g"
@@ -1559,28 +1704,34 @@ void loop() {
     server.handleClient(); // Double appel pour traiter toutes les requêtes
   }
 
-  // Appeler webSocket.loop() en début de boucle pour traiter rapidement les
-  // messages
-  webSocket.loop();
-
-  // Appeler webSocket.loop() plusieurs fois pour réduire la latence
-  // Important pour 20 pesées/seconde
-  webSocket.loop();
-  webSocket.loop();
-  webSocket.loop();
+  // Traiter WebSocket (accept + poll clients)
+  wsLoop();
+  wsLoop();
+  wsLoop();
+  wsLoop();
 
   // Envoi périodique stats système (1s) + poids et DAC pour page paramètres DAC
   static uint32_t lastSysStats = 0;
-  if (millis() - lastSysStats > 1000 && webSocket.connectedClients() > 0) {
-    String escWeight = lastWeight;
-    escWeight.replace("\\", "\\\\");
-    escWeight.replace("\"", "\\\"");
+  if (millis() - lastSysStats > 1000 && wsConnectedCount() > 0) {
+    String weightForDacDisplay = lastDisplayedValue.length() > 0
+                                     ? lastDisplayedValue
+                                     : formatWeightForDisplay(lastWeight);
+    weightForDacDisplay.replace("\\", "\\\\");
+    weightForDacDisplay.replace("\"", "\\\"");
+    int8_t bat = getBatteryLevel();
     String json = "{\"type\":\"sys\",\"temp\":" + String(getCoreTemp(), 1) +
                   ",\"cpu\":" + String(cpuLoad, 0) +
                   ",\"heap\":" + String(ESP.getFreeHeap() / 1024) +
-                  ",\"weight\":\"" + escWeight + "\"" +
-                  ",\"dacMv\":" + String(lastDacMv) + "}";
-    webSocket.broadcastTXT(json);
+                  ",\"weight\":\"" + weightForDacDisplay + "\"" +
+                  ",\"dacMv\":" + String(lastDacMv) +
+                  ",\"battery\":" + String((int)bat) +
+                  ",\"charging\":" + String(isBatteryCharging() ? "true" : "false");
+    if (cfg.weightColorByStability) {
+      json += ",\"stable\":";
+      json += isWeightStable() ? "true" : "false";
+    }
+    json += "}";
+    wsBroadcastTXT(json.c_str());
     lastSysStats = millis();
   }
 
@@ -1650,49 +1801,67 @@ void loop() {
 
           lastWeight = cleaned;
           lastWeightMs = millis();
+          String displayStr = formatWeightForDisplay(cleaned);
+          lastDisplayedValue = displayStr;  // Une seule source pour l'affichage (jamais ST/US)
+          if (displayStr != lastFormattedValue) {
+            lastFormattedValue = displayStr;
+            lastFormattedValueSince = millis();
+          }
 
-          // Poids -> mV (toujours calculer si DAC activé en config, pour affichage web)
+          // Poids -> mV : utiliser la valeur nettoyée pour le DAC (sans ST/US)
           if (cfg.dac2_enabled) {
-            float wg = parseWeightGrams(cleaned);
+            String forDac = getWeightStringForDac(cleaned);
+            float wg = parseWeightGrams(forDac);
             uint16_t mv = weightToDacMv(wg);
             lastDacMv = mv;  // Affichage web même si matériel non connecté
             if (dac2Ok)
               setDac2Output(mv);  // Envoyer au DAC seulement si init OK
           }
 
-          // Envoyer IMMÉDIATEMENT chaque pesée via WebSocket (sans limitation)
-          uint8_t clients = webSocket.connectedClients();
+          // Envoyer chaque pesée via WebSocket (poids brut pour données)
+          uint8_t clients = wsConnectedCount();
           if (clients > 0) {
-            char json[144];
-            snprintf(json, sizeof(json), "{\"weight\":\"%s\",\"dacMv\":%u}",
-                     cleaned.c_str(), lastDacMv);
-            webSocket.broadcastTXT(json);
+            bool st = cfg.weightColorByStability ? isWeightStable() : false;
+            char json[160];
+            if (cfg.weightColorByStability) {
+              snprintf(json, sizeof(json), "{\"weight\":\"%s\",\"dacMv\":%u,\"stable\":%s}",
+                       lastDisplayedValue.c_str(), lastDacMv, st ? "true" : "false");
+            } else {
+              snprintf(json, sizeof(json), "{\"weight\":\"%s\",\"dacMv\":%u}",
+                       lastDisplayedValue.c_str(), lastDacMv);
+            }
+            wsBroadcastTXT(json);
 
-            // Mettre à jour l'écran AtomS3 dans l'interface web IMMÉDIATEMENT
-            char screenJson[128];
-            snprintf(
-                screenJson, sizeof(screenJson),
-                "{\"type\":\"screen\",\"mode\":\"weight\",\"content\":\"%s\"}",
-                cleaned.c_str());
-            webSocket.broadcastTXT(screenJson);
+            // Écran web : valeur formatée + stable pour couleur, throttle 20 Hz
+            if (millis() - lastScreenSendMs >= SCREEN_SEND_INTERVAL_MS) {
+              lastScreenSendMs = millis();
+              char screenJson[160];
+              if (cfg.weightColorByStability) {
+                snprintf(screenJson, sizeof(screenJson),
+                         "{\"type\":\"screen\",\"mode\":\"weight\",\"content\":\"%s\",\"stable\":%s}",
+                         lastDisplayedValue.c_str(), st ? "true" : "false");
+              } else {
+                snprintf(screenJson, sizeof(screenJson),
+                         "{\"type\":\"screen\",\"mode\":\"weight\",\"content\":\"%s\"}",
+                         lastDisplayedValue.c_str());
+              }
+              wsBroadcastTXT(screenJson);
+            }
 
-            // Forcer l'envoi immédiat en appelant loop() plusieurs fois
-            webSocket.loop();
-            webSocket.loop();
-            webSocket.loop();
+            wsLoop();
+            wsLoop();
+            wsLoop();
           }
 
-          // Mise à jour écran physique limitée (pour ne pas surcharger
-          // l'affichage)
+          // Écran physique : valeur formatée, 20 FPS max (20 pesées/s)
           static uint32_t lastScreenDraw = 0;
-          if (millis() - lastScreenDraw >
-              50) { // 20 FPS max pour l'écran physique
-            drawWeightScreen(lastWeight);
+          if (millis() - lastScreenDraw >= SCREEN_SEND_INTERVAL_MS) {
+            drawWeightScreen(lastDisplayedValue);
             lastScreenDraw = millis();
           }
 
           // Logger terminal seulement si demandé
-          if (webSocket.connectedClients() > 0) {
+          if (wsConnectedCount() > 0) {
             addTerminalLog("RX", String(lineBuf));
           }
 
@@ -1727,9 +1896,16 @@ void loop() {
     if (s.length() > 0) {
       String cleaned = parseBalanceResponse(s);
 
+      String displayStrTimeout = formatWeightForDisplay(cleaned);
+      lastDisplayedValue = displayStrTimeout;
+      if (displayStrTimeout != lastFormattedValue) {
+        lastFormattedValue = displayStrTimeout;
+        lastFormattedValueSince = millis();
+      }
+
       // Logger dans le terminal (RX - timeout) - seulement si des clients
       // WebSocket sont connectés
-      uint8_t wsClientsTimeout = webSocket.connectedClients();
+      uint8_t wsClientsTimeout = wsConnectedCount();
       if (wsClientsTimeout > 0) {
         String rawData = String(lineBuf);
         addTerminalLog("RX", rawData);
@@ -1738,40 +1914,54 @@ void loop() {
       lastWeight = cleaned;
       lastWeightMs = millis();
 
-      // Poids -> mV (toujours calculer si DAC activé en config, pour affichage web)
+      // Poids -> mV : utiliser la valeur nettoyée pour le DAC (sans ST/US)
       if (cfg.dac2_enabled) {
-        float wg = parseWeightGrams(cleaned);
+        String forDac = getWeightStringForDac(cleaned);
+        float wg = parseWeightGrams(forDac);
         uint16_t mv = weightToDacMv(wg);
         lastDacMv = mv;  // Affichage web même si matériel non connecté
         if (dac2Ok)
           setDac2Output(mv);  // Envoyer au DAC seulement si init OK
       }
 
-      // Envoyer IMMÉDIATEMENT via WebSocket (même traitement)
-      uint8_t clients = webSocket.connectedClients();
+      // WebSocket : poids brut + écran formaté (throttle 20 Hz)
+      uint8_t clients = wsConnectedCount();
       if (clients > 0) {
-        char json[144];
-        snprintf(json, sizeof(json), "{\"weight\":\"%s\",\"dacMv\":%u}",
-                 cleaned.c_str(), lastDacMv);
-        webSocket.broadcastTXT(json);
+        bool st = cfg.weightColorByStability ? isWeightStable() : false;
+        char json[160];
+        if (cfg.weightColorByStability) {
+          snprintf(json, sizeof(json), "{\"weight\":\"%s\",\"dacMv\":%u,\"stable\":%s}",
+                   lastDisplayedValue.c_str(), lastDacMv, st ? "true" : "false");
+        } else {
+          snprintf(json, sizeof(json), "{\"weight\":\"%s\",\"dacMv\":%u}",
+                   lastDisplayedValue.c_str(), lastDacMv);
+        }
+        wsBroadcastTXT(json);
 
-        // Mettre à jour l'écran AtomS3 dans l'interface web IMMÉDIATEMENT
-        char screenJson[128];
-        snprintf(screenJson, sizeof(screenJson),
-                 "{\"type\":\"screen\",\"mode\":\"weight\",\"content\":\"%s\"}",
-                 cleaned.c_str());
-        webSocket.broadcastTXT(screenJson);
+        if (millis() - lastScreenSendMs >= SCREEN_SEND_INTERVAL_MS) {
+          lastScreenSendMs = millis();
+          char screenJson[160];
+          if (cfg.weightColorByStability) {
+            snprintf(screenJson, sizeof(screenJson),
+                     "{\"type\":\"screen\",\"mode\":\"weight\",\"content\":\"%s\",\"stable\":%s}",
+                     lastDisplayedValue.c_str(), st ? "true" : "false");
+          } else {
+            snprintf(screenJson, sizeof(screenJson),
+                     "{\"type\":\"screen\",\"mode\":\"weight\",\"content\":\"%s\"}",
+                     lastDisplayedValue.c_str());
+          }
+          wsBroadcastTXT(screenJson);
+        }
 
-        // Forcer l'envoi immédiat en appelant loop() plusieurs fois
-        webSocket.loop();
-        webSocket.loop();
-        webSocket.loop();
+        wsLoop();
+        wsLoop();
+        wsLoop();
       }
 
-      // Mise à jour écran physique limitée
+      // Écran physique : valeur formatée, 20 Hz max
       static uint32_t lastScreenDrawTimeout = 0;
-      if (millis() - lastScreenDrawTimeout > 50) {
-        drawWeightScreen(lastWeight);
+      if (millis() - lastScreenDrawTimeout >= SCREEN_SEND_INTERVAL_MS) {
+        drawWeightScreen(lastDisplayedValue);
         lastScreenDrawTimeout = millis();
       }
 
@@ -1787,6 +1977,13 @@ void loop() {
       uiMode = UiMode::IdleClock;
       modeEnteredAt = millis();
       drawIdleScreen();
+    } else {
+      // Redessin périodique (100 ms) pour réévaluer la couleur stabilité (vert/orange)
+      static uint32_t lastWeightRedraw = 0;
+      if (millis() - lastWeightRedraw >= 100) {
+        lastWeightRedraw = millis();
+        drawWeightScreen(lastDisplayedValue);
+      }
     }
   } else if (uiMode == UiMode::IdleClock) {
     static uint32_t lastIdle = 0;

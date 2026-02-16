@@ -31,6 +31,7 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
             --red-50:  #fef2f2;
             
             --yellow-400: #facc15;
+            --orange-500: #f97316;
             
             --bg-body: var(--slate-50);
             --text-main: var(--slate-700);
@@ -160,6 +161,7 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
         .text-blue-600 { color: var(--blue-600); }
         .text-green-500 { color: var(--green-500); }
         .text-green-600 { color: var(--green-600); }
+        .text-orange-500 { color: var(--orange-500); }
         .text-red-600 { color: var(--red-600); }
         .text-yellow-400 { color: var(--yellow-400); }
 
@@ -471,8 +473,21 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
                                 <span class="text-xs text-slate-500">System Load</span>
                                 <span id="sys-cpu" class="text-xs font-semibold text-slate-800">--%</span>
                             </div>
-                            <div class="w-full bg-slate-100 h-2 rounded-full" style="height: 0.5rem; border-radius: 9999px;">
+                            <div class="w-full bg-slate-100 h-2 rounded-full mb-3" style="height: 0.5rem; border-radius: 9999px;">
                                 <div id="sys-cpu-bar" class="bg-green-500 h-full rounded-full" style="width: 0%; height: 100%; border-radius: 9999px; transition: width 0.5s;"></div>
+                            </div>
+
+                            <div class="flex justify-between items-center mb-1">
+                                <span class="text-xs text-slate-500">Battery</span>
+                                <span id="sys-battery" class="text-xs font-semibold text-slate-800">--%</span>
+                            </div>
+                            <div class="w-full bg-slate-100 h-2 rounded-full mb-3" style="height: 0.5rem; border-radius: 9999px;">
+                                <div id="sys-battery-bar" class="bg-green-500 h-full rounded-full" style="width: 0%; height: 100%; border-radius: 9999px; transition: width 0.5s;"></div>
+                            </div>
+
+                            <div class="flex justify-between items-center mb-1">
+                                <span class="text-xs text-slate-500">DAC Output</span>
+                                <span id="sys-dac" class="text-xs font-semibold text-blue-600 font-mono">-- mV</span>
                             </div>
                         </div>
                     </section>
@@ -662,6 +677,31 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
                         <span class="text-sm font-medium text-slate-700">Indicateur Wi‑Fi sur l'écran</span>
                         <label class="switch">
                             <input type="checkbox" name="wifiind" %WIFIIND_CHECK%>
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    <div class="flex items-center justify-between p-3 bg-slate-50 rounded border border-slate-100">
+                        <span class="text-sm font-medium text-slate-700">Couleur selon stabilité (valeur identique pendant X s → vert foncé, sinon orange)</span>
+                        <label class="switch">
+                            <input type="checkbox" name="wcolorst" %WCOLORST_CHECK%>
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    <div class="flex items-center justify-between p-3 bg-slate-50 rounded border border-slate-100 gap-4">
+                        <span class="text-sm font-medium text-slate-700">Durée stabilité (secondes) pour passer en vert</span>
+                        <input type="number" name="wstabms" min="1" max="30" value="%WSTABMS%" class="w-16 px-2 py-1 bg-white border border-slate-200 rounded text-sm">
+                    </div>
+                    <div class="flex items-center justify-between p-3 bg-slate-50 rounded border border-slate-100">
+                        <span class="text-sm font-medium text-slate-700">Masquer les zéros non significatifs (ex. +00066,20g → 66,20g)</span>
+                        <label class="switch">
+                            <input type="checkbox" name="whidez" %WHIDEZ_CHECK%>
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    <div class="flex items-center justify-between p-3 bg-slate-50 rounded border border-slate-100">
+                        <span class="text-sm font-medium text-slate-700">Afficher le signe + pour les valeurs positives</span>
+                        <label class="switch">
+                            <input type="checkbox" name="wplus" %WPLUS_CHECK%>
                             <span class="slider"></span>
                         </label>
                     </div>
@@ -961,6 +1001,14 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
     let ws = null;
     let wsReconnectTimeout = null;
 
+    function applyWeightStableColor(el, stable) {
+        if (!el) return;
+        el.classList.remove('text-slate-900', 'text-green-600', 'text-orange-500');
+        if (stable === true) el.classList.add('text-green-600');
+        else if (stable === false) el.classList.add('text-orange-500');
+        else el.classList.add('text-slate-900');
+    }
+
     function connectWebSocket() {
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const wsHost = window.location.hostname;
@@ -978,13 +1026,22 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
             fetch('/api/monitor')
                 .then(res => res.json())
                 .then(data => {
-                    if (data.screen) updateScreen(data.screen);
+                    if (data.screen) {
+                        var contentEl = document.getElementById('screen-content');
+                        var modeEl = document.getElementById('screen-mode');
+                        if (contentEl) contentEl.innerText = data.screen.content || '---';
+                        if (modeEl) modeEl.innerText = 'Mode: ' + (data.screen.mode || 'idle');
+                    }
                     if (data.terminal) updateTerminal(data.terminal);
                     if (data.temp !== undefined) updateSensors(data.temp, data.cpu);
+                    updateHardwareProfile(data.battery, data.charging, data.dacMv);
+                    var contentEl = document.getElementById('screen-content');
                     var wEl = document.getElementById('dac-current-weight');
                     var mEl = document.getElementById('dac-current-mv');
                     if (wEl && data.weight !== undefined) wEl.innerText = data.weight || '---';
                     if (mEl && data.dacMv !== undefined) mEl.innerText = String(data.dacMv);
+                    applyWeightStableColor(contentEl, data.stable);
+                    applyWeightStableColor(wEl, data.stable);
                 })
                 .catch(err => console.log('Monitor fetch error', err));
         };
@@ -997,19 +1054,24 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
                     const modeEl = document.getElementById('screen-mode');
                     if (contentEl) contentEl.innerText = data.content || '---';
                     if (modeEl) modeEl.innerText = 'Mode: ' + (data.mode || 'idle');
+                    applyWeightStableColor(contentEl, data.stable);
                 } else if (data.type === 'terminal') {
                     addTerminalLine(data.direction, data.data, data.timestamp);
                 } else if (data.type === 'sys') {
                     updateSensors(data.temp, data.cpu);
+                    updateHardwareProfile(data.battery, data.charging, data.dacMv);
                     var wEl = document.getElementById('dac-current-weight');
                     var mEl = document.getElementById('dac-current-mv');
                     if (wEl && data.weight !== undefined) wEl.innerText = data.weight || '---';
                     if (mEl && data.dacMv !== undefined) mEl.innerText = String(data.dacMv);
+                    applyWeightStableColor(wEl, data.stable);
                 } else if (data.weight) {
                     const contentEl = document.getElementById('screen-content');
-                    if(contentEl) contentEl.innerText = data.weight;
                     var wEl = document.getElementById('dac-current-weight');
+                    if(contentEl) contentEl.innerText = data.weight;
                     if (wEl) wEl.innerText = data.weight;
+                    applyWeightStableColor(contentEl, data.stable);
+                    applyWeightStableColor(wEl, data.stable);
                     if (data.dacMv !== undefined) {
                         var mEl = document.getElementById('dac-current-mv');
                         if (mEl) mEl.innerText = String(data.dacMv);
@@ -1077,6 +1139,27 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
                  else if(cpu > 50) cBar.classList.replace('bg-green-500', 'text-yellow-400'); // Note: bg color logic simplified
                  else cBar.style.backgroundColor = 'var(--green-500)';
              }
+        }
+    }
+
+    function updateHardwareProfile(battery, charging, dacMv) {
+        if (battery !== undefined && battery >= 0) {
+            const bEl = document.getElementById('sys-battery');
+            const bBar = document.getElementById('sys-battery-bar');
+            if (bEl) bEl.innerText = charging ? 'Charging ' + battery + '%' : battery + '%';
+            if (bBar) {
+                bBar.style.width = Math.min(100, Math.max(0, battery)) + '%';
+                bBar.style.backgroundColor = battery <= 20 ? 'var(--red-600)' : (charging ? 'var(--blue-500)' : 'var(--green-500)');
+            }
+        } else {
+            const bEl = document.getElementById('sys-battery');
+            const bBar = document.getElementById('sys-battery-bar');
+            if (bEl) bEl.innerText = 'N/A';
+            if (bBar) bBar.style.width = '0%';
+        }
+        if (dacMv !== undefined) {
+            const dEl = document.getElementById('sys-dac');
+            if (dEl) dEl.innerText = String(dacMv) + ' mV';
         }
     }
 
