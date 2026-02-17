@@ -470,24 +470,11 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
                             </div>
 
                             <div class="flex justify-between items-center mb-1">
-                                <span class="text-xs text-slate-500">System Load</span>
-                                <span id="sys-cpu" class="text-xs font-semibold text-slate-800">--%</span>
-                            </div>
-                            <div class="w-full bg-slate-100 h-2 rounded-full mb-3" style="height: 0.5rem; border-radius: 9999px;">
-                                <div id="sys-cpu-bar" class="bg-green-500 h-full rounded-full" style="width: 0%; height: 100%; border-radius: 9999px; transition: width 0.5s;"></div>
-                            </div>
-
-                            <div class="flex justify-between items-center mb-1">
-                                <span class="text-xs text-slate-500">Battery</span>
-                                <span id="sys-battery" class="text-xs font-semibold text-slate-800">--%</span>
-                            </div>
-                            <div class="w-full bg-slate-100 h-2 rounded-full mb-3" style="height: 0.5rem; border-radius: 9999px;">
-                                <div id="sys-battery-bar" class="bg-green-500 h-full rounded-full" style="width: 0%; height: 100%; border-radius: 9999px; transition: width 0.5s;"></div>
-                            </div>
-
-                            <div class="flex justify-between items-center mb-1">
                                 <span class="text-xs text-slate-500">DAC Output</span>
-                                <span id="sys-dac" class="text-xs font-semibold text-blue-600 font-mono">-- mV</span>
+                                <span id="sys-dac" class="text-xs font-semibold text-blue-600 font-mono">--.--V</span>
+                            </div>
+                            <div class="w-full bg-slate-100 h-2 rounded-full mb-3" style="height: 0.5rem; border-radius: 9999px;">
+                                <div id="sys-dac-bar" class="bg-blue-500 h-full rounded-full" style="width: 0%; height: 100%; border-radius: 9999px; transition: width 0.5s;"></div>
                             </div>
                         </div>
                     </section>
@@ -1000,6 +987,8 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
 
     let ws = null;
     let wsReconnectTimeout = null;
+    const TERMINAL_MAX_LINES = 200;
+    const TERMINAL_MAX_LINE_LENGTH = 220;
 
     function applyWeightStableColor(el, stable) {
         if (!el) return;
@@ -1087,30 +1076,43 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
         };
     }
 
+    function trimTerminalLine(text) {
+        const s = String(text ?? '');
+        if (s.length <= TERMINAL_MAX_LINE_LENGTH) return s;
+        return s.slice(0, TERMINAL_MAX_LINE_LENGTH - 3) + '...';
+    }
+
+    function pruneTerminalLines(term) {
+        while (term.childElementCount > TERMINAL_MAX_LINES) {
+            term.removeChild(term.firstChild);
+        }
+    }
+
     function addTerminalLine(dir, data, ts) {
         const term = document.getElementById('terminal');
         if(!term) return;
         const row = document.createElement('div');
         row.className = dir === 'TX' ? 'text-yellow-400' : 'text-blue-500';
         const time = ts ? ts : new Date().toLocaleTimeString();
-        row.innerText = `[${time}] ${dir}: ${data}`;
+        row.innerText = `[${time}] ${dir}: ${trimTerminalLine(data)}`;
         term.appendChild(row);
+        pruneTerminalLines(term);
         term.scrollTop = term.scrollHeight;
-        if(term.childElementCount > 100) term.removeChild(term.firstChild);
     }
     
     function updateTerminal(log) {
        const term = document.getElementById('terminal');
        if(!term || !log) return;
        term.innerHTML = ''; 
-       const lines = log.split('\n');
-       lines.forEach(l => {
-           if(l) {
-               const d = document.createElement('div');
-               d.innerText = l;
-               term.appendChild(d);
-           }
+       const lines = log.split('\n').filter(Boolean);
+       const start = Math.max(0, lines.length - TERMINAL_MAX_LINES);
+       const keptLines = lines.slice(start);
+       keptLines.forEach(l => {
+           const d = document.createElement('div');
+           d.innerText = trimTerminalLine(l);
+           term.appendChild(d);
        });
+       pruneTerminalLines(term);
        term.scrollTop = term.scrollHeight;
     }
 
@@ -1142,24 +1144,17 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
         }
     }
 
-    function updateHardwareProfile(battery, charging, dacMv) {
-        if (battery !== undefined && battery >= 0) {
-            const bEl = document.getElementById('sys-battery');
-            const bBar = document.getElementById('sys-battery-bar');
-            if (bEl) bEl.innerText = charging ? 'Charging ' + battery + '%' : battery + '%';
-            if (bBar) {
-                bBar.style.width = Math.min(100, Math.max(0, battery)) + '%';
-                bBar.style.backgroundColor = battery <= 20 ? 'var(--red-600)' : (charging ? 'var(--blue-500)' : 'var(--green-500)');
-            }
+    function updateHardwareProfile(_battery, _charging, dacMv) {
+        const dEl = document.getElementById('sys-dac');
+        const dBar = document.getElementById('sys-dac-bar');
+        if (dacMv !== undefined && dacMv !== null) {
+            const safeMv = Math.min(10000, Math.max(0, Number(dacMv) || 0));
+            const dacPercent = (safeMv / 10000) * 100;
+            if (dEl) dEl.innerText = (safeMv / 1000).toFixed(2) + 'V';
+            if (dBar) dBar.style.width = dacPercent + '%';
         } else {
-            const bEl = document.getElementById('sys-battery');
-            const bBar = document.getElementById('sys-battery-bar');
-            if (bEl) bEl.innerText = 'N/A';
-            if (bBar) bBar.style.width = '0%';
-        }
-        if (dacMv !== undefined) {
-            const dEl = document.getElementById('sys-dac');
-            if (dEl) dEl.innerText = String(dacMv) + ' mV';
+            if (dEl) dEl.innerText = '--.--V';
+            if (dBar) dBar.style.width = '0%';
         }
     }
 
