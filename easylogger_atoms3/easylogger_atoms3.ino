@@ -1501,10 +1501,10 @@ void drawWeightScreen(const String &displayOrRaw) {
   // Sous le poids : tension DAC (mV) si DAC2 activé
   if (cfg.dac2_enabled) {
     char dacStr[24];
-    snprintf(dacStr, sizeof(dacStr), "%u mV", lastDacMv);
+    snprintf(dacStr, sizeof(dacStr), "%umV", lastDacMv);
     d.setTextDatum(middle_center);
     d.setTextColor(CYAN);
-    d.setTextSize(1);
+    d.setTextSize(2);
     d.drawString(dacStr, d.width() / 2, d.height() / 2 + 20);
   }
   drawDateTime();
