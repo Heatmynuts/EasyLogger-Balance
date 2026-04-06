@@ -2,6 +2,8 @@
 
 **Balance WiFi pour M5AtomS3**
 
+**Firmware v2.2.0** — table de calibration DAC 5 à 20 points, envoi HTML en chunks (stabilité RAM / tablette), correctif `WiFiClientSecure` pour WebSockets2.
+
 ## Description
 
 EasyLogger Balance est un firmware pour M5AtomS3 qui permet de connecter une balance série (A&D ou Sartorius) et de transmettre les pesées en temps réel via WiFi/WebSocket.
@@ -22,13 +24,13 @@ EasyLogger Balance est un firmware pour M5AtomS3 qui permet de connecter une bal
 
 ## Option DAC2 (Unit DAC2 GP8413)
 
-Sortie analogique 0-10V proportionnelle à la pesée. Convertisseur 15 bits I2C avec étalonnage 6 points pour corriger les interférences.
+Sortie analogique 0–10 V proportionnelle à la pesée (15 bits I2C). Calibration par **5 à 20 points** (poids négatifs possibles), sous-plage calibrée → **0 V**, sur-plage → **10 V**. Option **courbe lissée** (quadratique moindres carrés) et aperçu graphique dans l’onglet DAC.
 
 **Bibliothèque requise :** DFRobot_GP8XXX (via Gestionnaire de bibliothèques Arduino)
 
 ## Installation
 
-1. Ouvrir `ATOMS3-GCA.ino` dans Arduino IDE
+1. Ouvrir `easylogger_atoms3/easylogger_atoms3.ino` dans Arduino IDE
 2. Sélectionner la carte **M5AtomS3**
 3. Téléverser le code
 4. Se connecter au réseau WiFi `Easylogger-XXXX` (mot de passe: `easylogger`)

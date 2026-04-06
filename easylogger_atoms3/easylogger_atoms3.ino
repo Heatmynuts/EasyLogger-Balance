@@ -12,12 +12,23 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <WebServer.h>
-#include <WebSockets2_Generic.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <WebSockets2_Generic.h>
 
 using namespace websockets2_generic;
 #include <Wire.h>
+#include <math.h>
+#include <pgmspace.h>
 #include <time.h>
+
+#define DAC2_CAL_MIN 5
+#define DAC2_CAL_MAX 20
+
+// Coefficients moindres carrés (mV = a0 + a1*w + a2*w²), recalculés après load/save
+static float g_dac2_poly[3] = {0};
+static bool g_dac2_poly_ok = false;
+static void applyDacCalibrationMath();
 
 // -------- Capteurs Internes --------
 temperature_sensor_handle_t temp_sensor = NULL;
@@ -137,12 +148,12 @@ struct AppConfig {
 
   // Sortie DAC2 (Unit DAC2 GP8413 - 15 bits, I2C 0x59)
   bool dac2_enabled = false;
-  float dac2_range_min = 0.0f;    // Plage début (g)
-  float dac2_range_max = 1000.0f; // Plage fin (g)
-  float dac2_cal_weight[6] = {0,   200, 400,
-                              600, 800, 1000}; // Points calibration (g)
-  uint16_t dac2_cal_mv[6] = {0,    2000, 4000,
-                             6000, 8000, 10000}; // mV correspondants (0-10000)
+  float dac2_range_min = 0.0f;    // Aligné sur 1er point cal. (affichage)
+  float dac2_range_max = 1000.0f; // Aligné sur dernier point cal.
+  uint8_t dac2_cal_count = 6;
+  bool dac2_smooth = false; // Option : courbe quadratique (moindres carrés)
+  float dac2_cal_weight[DAC2_CAL_MAX] = {0, 200, 400, 600, 800, 1000};
+  uint16_t dac2_cal_mv[DAC2_CAL_MAX] = {0, 2000, 4000, 6000, 8000, 10000};
 } cfg;
 
 // DAC2 GP8413 (I2C 0x59, 15 bits, 0-10V) - Unit DAC2 sur bus I2C
@@ -509,7 +520,9 @@ void saveConfig() {
   prefs.putBool("dac2en", cfg.dac2_enabled);
   prefs.putFloat("dac2min", cfg.dac2_range_min);
   prefs.putFloat("dac2max", cfg.dac2_range_max);
-  for (int i = 0; i < 6; i++) {
+  prefs.putUChar("d2cn", cfg.dac2_cal_count);
+  prefs.putBool("d2sm", cfg.dac2_smooth);
+  for (int i = 0; i < cfg.dac2_cal_count; i++) {
     char kw[8], km[8];
     snprintf(kw, sizeof(kw), "d2w%d", i);
     snprintf(km, sizeof(km), "d2m%d", i);
@@ -578,15 +591,35 @@ void loadConfig() {
   cfg.dac2_enabled = prefs.getBool("dac2en", false);
   cfg.dac2_range_min = prefs.getFloat("dac2min", 0.0f);
   cfg.dac2_range_max = prefs.getFloat("dac2max", 1000.0f);
-  for (int i = 0; i < 6; i++) {
-    char kw[8], km[8];
-    snprintf(kw, sizeof(kw), "d2w%d", i);
-    snprintf(km, sizeof(km), "d2m%d", i);
-    cfg.dac2_cal_weight[i] = prefs.getFloat(
-        kw, cfg.dac2_range_min +
-                (cfg.dac2_range_max - cfg.dac2_range_min) * i / 5.0f);
-    cfg.dac2_cal_mv[i] =
-        (uint16_t)prefs.getUShort(km, (uint16_t)(10000U * i / 5));
+  cfg.dac2_smooth = prefs.getBool("d2sm", false);
+  {
+    uint8_t n = prefs.getUChar("d2cn", 0);
+    if (n == 0) {
+      cfg.dac2_cal_count = 6;
+      for (int i = 0; i < 6; i++) {
+        char kw[8], km[8];
+        snprintf(kw, sizeof(kw), "d2w%d", i);
+        snprintf(km, sizeof(km), "d2m%d", i);
+        cfg.dac2_cal_weight[i] = prefs.getFloat(
+            kw, cfg.dac2_range_min +
+                    (cfg.dac2_range_max - cfg.dac2_range_min) * i / 5.0f);
+        cfg.dac2_cal_mv[i] =
+            (uint16_t)prefs.getUShort(km, (uint16_t)(10000U * i / 5));
+      }
+    } else {
+      if (n < DAC2_CAL_MIN)
+        n = DAC2_CAL_MIN;
+      if (n > DAC2_CAL_MAX)
+        n = DAC2_CAL_MAX;
+      cfg.dac2_cal_count = n;
+      for (int i = 0; i < n; i++) {
+        char kw[8], km[8];
+        snprintf(kw, sizeof(kw), "d2w%d", i);
+        snprintf(km, sizeof(km), "d2m%d", i);
+        cfg.dac2_cal_weight[i] = prefs.getFloat(kw, 0.0f);
+        cfg.dac2_cal_mv[i] = (uint16_t)prefs.getUShort(km, 0);
+      }
+    }
   }
   prefs.end();
 
@@ -612,6 +645,20 @@ void loadConfig() {
              cfg.balanceBaud == 2400) {
     cfg.balanceBaud = 9600;
   }
+
+  if (cfg.dac2_cal_count < DAC2_CAL_MIN || cfg.dac2_cal_count > DAC2_CAL_MAX) {
+    cfg.dac2_cal_count = 6;
+    float r0 = 0.0f, r1 = 1000.0f;
+    if (cfg.dac2_range_max > cfg.dac2_range_min) {
+      r0 = cfg.dac2_range_min;
+      r1 = cfg.dac2_range_max;
+    }
+    for (int i = 0; i < 6; i++) {
+      cfg.dac2_cal_weight[i] = r0 + (r1 - r0) * i / 5.0f;
+      cfg.dac2_cal_mv[i] = (uint16_t)(10000U * i / 5);
+    }
+  }
+  applyDacCalibrationMath();
 }
 
 String nowDateTime() {
@@ -775,14 +822,195 @@ bool startClientWiFi() {
   return false;
 }
 
+static void sortDacCalibrationInCfg() {
+  int n = cfg.dac2_cal_count;
+  if (n < 2)
+    return;
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = 0; j < n - i - 1; j++) {
+      if (cfg.dac2_cal_weight[j] > cfg.dac2_cal_weight[j + 1]) {
+        float tw = cfg.dac2_cal_weight[j];
+        cfg.dac2_cal_weight[j] = cfg.dac2_cal_weight[j + 1];
+        cfg.dac2_cal_weight[j + 1] = tw;
+        uint16_t tm = cfg.dac2_cal_mv[j];
+        cfg.dac2_cal_mv[j] = cfg.dac2_cal_mv[j + 1];
+        cfg.dac2_cal_mv[j + 1] = tm;
+      }
+    }
+  }
+}
+
+static bool solveLinear3x3(double A[3][3], double b[3], double x[3]) {
+  double aug[3][4];
+  for (int i = 0; i < 3; i++) {
+    for (int j = 0; j < 3; j++)
+      aug[i][j] = A[i][j];
+    aug[i][3] = b[i];
+  }
+  for (int col = 0; col < 3; col++) {
+    int piv = col;
+    for (int r = col + 1; r < 3; r++) {
+      if (fabs(aug[r][col]) > fabs(aug[piv][col]))
+        piv = r;
+    }
+    if (fabs(aug[piv][col]) < 1e-12)
+      return false;
+    if (piv != col) {
+      for (int c = col; c < 4; c++) {
+        double t = aug[col][c];
+        aug[col][c] = aug[piv][c];
+        aug[piv][c] = t;
+      }
+    }
+    double div = aug[col][col];
+    for (int c = col; c < 4; c++)
+      aug[col][c] /= div;
+    for (int r = 0; r < 3; r++) {
+      if (r == col)
+        continue;
+      double f = aug[r][col];
+      for (int c = col; c < 4; c++)
+        aug[r][c] -= f * aug[col][c];
+    }
+  }
+  x[0] = aug[0][3];
+  x[1] = aug[1][3];
+  x[2] = aug[2][3];
+  return true;
+}
+
+// Trie la table, met à jour plage affichée, calcule option quadratique moindres carrés
+static void applyDacCalibrationMath() {
+  g_dac2_poly_ok = false;
+  int n = cfg.dac2_cal_count;
+  if (n < DAC2_CAL_MIN)
+    return;
+  sortDacCalibrationInCfg();
+  cfg.dac2_range_min = cfg.dac2_cal_weight[0];
+  cfg.dac2_range_max = cfg.dac2_cal_weight[n - 1];
+
+  if (!cfg.dac2_smooth || n < 3)
+    return;
+
+  double S1 = 0, S2 = 0, S3 = 0, S4 = 0;
+  double T0 = 0, T1 = 0, T2 = 0;
+  for (int i = 0; i < n; i++) {
+    double wi = cfg.dac2_cal_weight[i];
+    double vi = (double)cfg.dac2_cal_mv[i];
+    double wi2 = wi * wi;
+    S1 += wi;
+    S2 += wi2;
+    S3 += wi2 * wi;
+    S4 += wi2 * wi2;
+    T0 += vi;
+    T1 += vi * wi;
+    T2 += vi * wi2;
+  }
+  double nn = (double)n;
+  double A[3][3] = {{nn, S1, S2}, {S1, S2, S3}, {S2, S3, S4}};
+  double b[3] = {T0, T1, T2};
+  double coef[3];
+  if (!solveLinear3x3(A, b, coef))
+    return;
+  g_dac2_poly[0] = (float)coef[0];
+  g_dac2_poly[1] = (float)coef[1];
+  g_dac2_poly[2] = (float)coef[2];
+  g_dac2_poly_ok = true;
+}
+
+// Lecture + tri + validation formulaire (avant toute mutation de cfg)
+static bool extractDacCalibrationFromRequest(float *w, uint16_t *mv, uint8_t *outN,
+                                               bool *outSmooth, char *err,
+                                               size_t errSz) {
+  *outSmooth = server.hasArg("dac2smooth");
+  int n;
+  if (server.hasArg("dac2_n"))
+    n = server.arg("dac2_n").toInt();
+  else
+    n = 6;
+  if (n < DAC2_CAL_MIN || n > DAC2_CAL_MAX) {
+    snprintf(err, errSz,
+             "DAC: nombre de points entre %d et %d.", DAC2_CAL_MIN, DAC2_CAL_MAX);
+    return false;
+  }
+  for (int i = 0; i < n; i++) {
+    char nw[16], nm[16];
+    snprintf(nw, sizeof(nw), "dac2w%d", i);
+    snprintf(nm, sizeof(nm), "dac2m%d", i);
+    if (!server.hasArg(nw)) {
+      snprintf(err, errSz, "DAC: poids du point %d manquant.", i);
+      return false;
+    }
+    if (!server.hasArg(nm)) {
+      snprintf(err, errSz, "DAC: tension du point %d manquante.", i);
+      return false;
+    }
+    w[i] = server.arg(nw).toFloat();
+    mv[i] = (uint16_t)constrain(server.arg(nm).toInt(), 0, 10000);
+  }
+  for (int i = 0; i < n - 1; i++) {
+    for (int j = 0; j < n - i - 1; j++) {
+      if (w[j] > w[j + 1]) {
+        float tw = w[j];
+        w[j] = w[j + 1];
+        w[j + 1] = tw;
+        uint16_t tm = mv[j];
+        mv[j] = mv[j + 1];
+        mv[j + 1] = tm;
+      }
+    }
+  }
+  const float eps = 1e-4f;
+  for (int i = 0; i < n - 1; i++) {
+    if (fabsf(w[i + 1] - w[i]) < eps) {
+      snprintf(err, errSz,
+               "DAC: deux points ont le même poids (≈ %.4f g).", w[i]);
+      return false;
+    }
+  }
+  *outN = (uint8_t)n;
+  return true;
+}
+
 // ===== Interface Web (ajout config Datalogger) =====
 #include "page_index.h"
-String htmlIndex() {
-  auto ipcur = (WiFi.getMode() == WIFI_AP) ? WiFi.softAPIP() : WiFi.localIP();
-  String h = PAGE_INDEX;
+
+static size_t elProgmemLen(const char *p) {
+  size_t n = 0;
+  while (pgm_read_byte(p + n))
+    n++;
+  return n;
+}
+
+static String buildDacCalibrationRowsString() {
+  int n = (int)cfg.dac2_cal_count;
+  if (n < DAC2_CAL_MIN)
+    n = DAC2_CAL_MIN;
+  if (n > DAC2_CAL_MAX)
+    n = DAC2_CAL_MAX;
+  size_t est = (size_t)n * 220u + 32u;
+  String dacRows;
+  (void)dacRows.reserve(est);
+  for (int i = 0; i < n; i++) {
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+             "<div class=\"dac-cal-row grid grid-cols-2 gap-4 mb-2\">"
+             "<input name=\"dac2w%d\" type=\"number\" step=\"0.01\" "
+             "value=\"%.2f\" class=\"text-center\">"
+             "<input name=\"dac2m%d\" type=\"number\" min=\"0\" max=\"10000\" "
+             "value=\"%u\" class=\"text-center font-mono text-blue-600\">"
+             "</div>",
+             i, cfg.dac2_cal_weight[i], i, (unsigned)cfg.dac2_cal_mv[i]);
+    dacRows += buf;
+  }
+  return dacRows;
+}
+
+static void applyHtmlTemplateSubstitutions(String &h, const String &dacRows) {
+  (void)h.reserve(h.length() + 8000);
+
   h.replace("%TITLE%", cfg.title);
 
-  // Résumé réseau (sidebar Monitoring)
   {
     String networkSummary;
     if (WiFi.getMode() == WIFI_AP)
@@ -792,18 +1020,15 @@ String htmlIndex() {
     h.replace("%NETWORK_SUMMARY%", networkSummary);
   }
 
-  // WiFi
   h.replace("%CLI_CHECK%", cfg.client_enabled ? "checked" : "");
   h.replace("%SSID%", cfg.ssid);
   h.replace("%PASS%", cfg.pass);
-  // IP
   h.replace("%IP_DHCP_CHECK%", cfg.ip_dhcp ? "checked" : "");
   h.replace("%IP%", cfg.ip);
   h.replace("%MASK%", cfg.mask);
   h.replace("%GW%", cfg.gw);
   h.replace("%DNS%", cfg.dns);
 
-  // UI
   h.replace("%IDLE%", cfg.idleText);
   h.replace("%FONT%", String(cfg.fontMain));
   h.replace("%SHOWMS%", String(cfg.showWeightMs));
@@ -821,8 +1046,8 @@ String htmlIndex() {
   h.replace("%WSTABMS%", String(cfg.weightStabilityMs / 1000));
   h.replace("%WHIDEZ_CHECK%", cfg.weightHideLeadingZeros ? "checked" : "");
   h.replace("%WPLUS_CHECK%", cfg.weightShowPlusSign ? "checked" : "");
+  h.replace("%WEIGHT%", "---");
 
-  // Balance
   h.replace("%BTYPE0%", (cfg.balanceType == 0) ? "selected" : "");
   h.replace("%BTYPE1%", (cfg.balanceType == 1) ? "selected" : "");
   h.replace("%BBAUD2400%", (cfg.balanceBaud == 2400) ? "selected" : "");
@@ -854,24 +1079,39 @@ String htmlIndex() {
 
   h.replace("%SWAPRT%", cfg.swapRxTx ? "checked" : "");
 
-  // DAC2
   h.replace("%DAC2EN_CHECK%", cfg.dac2_enabled ? "checked" : "");
-  h.replace("%DAC2MIN%", String(cfg.dac2_range_min, 1));
-  h.replace("%DAC2MAX%", String(cfg.dac2_range_max, 1));
-  h.replace("%DAC2W0%", String(cfg.dac2_cal_weight[0], 2));
-  h.replace("%DAC2M0%", String(cfg.dac2_cal_mv[0]));
-  h.replace("%DAC2W1%", String(cfg.dac2_cal_weight[1], 2));
-  h.replace("%DAC2M1%", String(cfg.dac2_cal_mv[1]));
-  h.replace("%DAC2W2%", String(cfg.dac2_cal_weight[2], 2));
-  h.replace("%DAC2M2%", String(cfg.dac2_cal_mv[2]));
-  h.replace("%DAC2W3%", String(cfg.dac2_cal_weight[3], 2));
-  h.replace("%DAC2M3%", String(cfg.dac2_cal_mv[3]));
-  h.replace("%DAC2W4%", String(cfg.dac2_cal_weight[4], 2));
-  h.replace("%DAC2M4%", String(cfg.dac2_cal_mv[4]));
-  h.replace("%DAC2W5%", String(cfg.dac2_cal_weight[5], 2));
-  h.replace("%DAC2M5%", String(cfg.dac2_cal_mv[5]));
+  h.replace("%DAC2MIN%", String(cfg.dac2_range_min, 2));
+  h.replace("%DAC2MAX%", String(cfg.dac2_range_max, 2));
+  h.replace("%DAC2_N%", String(cfg.dac2_cal_count));
+  h.replace("%DAC2SMOOTH_CHECK%", cfg.dac2_smooth ? "checked" : "");
+  h.replace("%DAC2CAL_ROWS%", dacRows);
+}
 
-  return h;
+static bool sendHtmlPartFromProgmem(const char *part PROGMEM,
+                                    const String &dacRows) {
+  size_t len = elProgmemLen(part);
+  String chunk;
+  const size_t margin = 8000;
+  if (!chunk.reserve(len + margin)) {
+    Serial.printf("[HTML] chunk reserve fail need~%u heap=%u maxblk=%u\n",
+                  (unsigned)(len + margin), (unsigned)ESP.getFreeHeap(),
+                  (unsigned)ESP.getMaxAllocHeap());
+    return false;
+  }
+  for (size_t i = 0; i < len; i++)
+    chunk += (char)pgm_read_byte(part + i);
+  if (chunk.length() != len) {
+    Serial.println("[HTML] copie PROGMEM invalide");
+    return false;
+  }
+  applyHtmlTemplateSubstitutions(chunk, dacRows);
+  if (chunk.length() == 0) {
+    Serial.println("[HTML] chunk vide après substitutions");
+    return false;
+  }
+  server.sendContent(chunk);
+  chunk = String();
+  return true;
 }
 
 // ===== HTTP Handlers =====
@@ -889,19 +1129,27 @@ void handleRoot() {
 
   sendCORS();
 
-  Serial.println("[HTTP] Generating HTML...");
-  String html = htmlIndex();
-  Serial.printf("[HTTP] HTML generated: %d bytes\n", html.length());
+  Serial.printf("[HTTP] heap free=%u max_block=%u\n",
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)ESP.getMaxAllocHeap());
 
-  if (html.length() == 0) {
-    Serial.println("[HTTP] ERROR: HTML is empty!");
-    server.send(500, "text/plain", "Error generating HTML");
-    return;
+  String dacRows = buildDacCalibrationRowsString();
+  if (dacRows.length() == 0 && cfg.dac2_cal_count > 0) {
+    Serial.println("[HTTP] dacRows vide");
   }
 
-  Serial.println("[HTTP] Sending HTML...");
-  server.send(200, "text/html", html);
-  Serial.println("[HTTP] HTML sent successfully");
+  server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+  server.send(200, "text/html", "");
+  bool ok = sendHtmlPartFromProgmem(PAGE_INDEX_P1, dacRows);
+  ok = ok && sendHtmlPartFromProgmem(PAGE_INDEX_P2, dacRows);
+  ok = ok && sendHtmlPartFromProgmem(PAGE_INDEX_P3, dacRows);
+  dacRows = String();
+
+  if (ok)
+    Serial.println("[HTTP] HTML envoyé (chunked, 3 parties)");
+  else
+    Serial.println("[HTTP] ERREUR pendant l'envoi HTML chunké");
+  // WebServer::_finalizeResponse() envoie le chunk terminal si besoin
 }
 
 // Appliquer les réglages UI sans redémarrer
@@ -957,6 +1205,17 @@ void reinitSerial2() {
 
 void handleSave() {
   String s;
+
+  float dacTmpW[DAC2_CAL_MAX];
+  uint16_t dacTmpM[DAC2_CAL_MAX];
+  uint8_t dacTmpN = 0;
+  bool dacTmpSmooth = false;
+  char dacErr[144];
+  if (!extractDacCalibrationFromRequest(dacTmpW, dacTmpM, &dacTmpN, &dacTmpSmooth,
+                                        dacErr, sizeof(dacErr))) {
+    server.send(400, "text/plain", dacErr);
+    return;
+  }
 
   // Sauvegarder les anciennes valeurs WiFi pour détecter les changements
   bool oldClientEnabled = cfg.client_enabled;
@@ -1045,19 +1304,15 @@ void handleSave() {
     cfg.swapRxTx = server.hasArg("swaprt");
   }
 
-  // DAC2
+  // DAC2 (table validée en début de handler)
   cfg.dac2_enabled = server.hasArg("dac2en");
-  cfg.dac2_range_min = server.arg("dac2min").toFloat();
-  cfg.dac2_range_max = server.arg("dac2max").toFloat();
-  for (int i = 0; i < 6; i++) {
-    char nw[16], nm[16];
-    snprintf(nw, sizeof(nw), "dac2w%d", i);
-    snprintf(nm, sizeof(nm), "dac2m%d", i);
-    cfg.dac2_cal_weight[i] = server.arg(nw).toFloat();
-    cfg.dac2_cal_mv[i] = (uint16_t)constrain(server.arg(nm).toInt(), 0, 10000);
+  cfg.dac2_cal_count = dacTmpN;
+  cfg.dac2_smooth = dacTmpSmooth;
+  for (int i = 0; i < dacTmpN; i++) {
+    cfg.dac2_cal_weight[i] = dacTmpW[i];
+    cfg.dac2_cal_mv[i] = dacTmpM[i];
   }
-  if (cfg.dac2_range_max <= cfg.dac2_range_min)
-    cfg.dac2_range_max = cfg.dac2_range_min + 1.0f;
+  applyDacCalibrationMath();
 
   // Terminator - seulement si on n'a pas déjà appliqué les paramètres Sartorius
   if (!(newBalanceType == (uint8_t)BalanceType::Sartorius &&
@@ -1550,29 +1805,46 @@ float parseWeightGrams(const String &s) {
   return t.toFloat();
 }
 
-// Convertir poids (g) en mV via calibration 6 points (interpolation linéaire
-// par segments)
+// Convertir poids (g) en mV : sous plage cal. → 0 mV, sur plage → 10000 mV
 uint16_t weightToDacMv(float weightG) {
-  if (weightG < cfg.dac2_range_min)
-    return cfg.dac2_cal_mv[0];
-  if (weightG > cfg.dac2_range_max)
-    return cfg.dac2_cal_mv[5];
-  if (weightG <= cfg.dac2_cal_weight[0])
-    return cfg.dac2_cal_mv[0];
-  if (weightG >= cfg.dac2_cal_weight[5])
-    return cfg.dac2_cal_mv[5];
-  for (int i = 0; i < 5; i++) {
-    if (weightG >= cfg.dac2_cal_weight[i] &&
-        weightG <= cfg.dac2_cal_weight[i + 1]) {
-      float w0 = cfg.dac2_cal_weight[i], w1 = cfg.dac2_cal_weight[i + 1];
-      float m0 = (float)cfg.dac2_cal_mv[i], m1 = (float)cfg.dac2_cal_mv[i + 1];
+  int n = cfg.dac2_cal_count;
+  if (n < DAC2_CAL_MIN)
+    return 0;
+  float wLo = cfg.dac2_cal_weight[0];
+  float wHi = cfg.dac2_cal_weight[n - 1];
+  if (weightG < wLo)
+    return 0;
+  if (weightG > wHi)
+    return 10000;
+
+  if (cfg.dac2_smooth && g_dac2_poly_ok && n >= 3) {
+    float mvF = g_dac2_poly[0] + g_dac2_poly[1] * weightG +
+                g_dac2_poly[2] * weightG * weightG;
+    if (mvF < 0.f)
+      mvF = 0.f;
+    if (mvF > 10000.f)
+      mvF = 10000.f;
+    return (uint16_t)(mvF + 0.5f);
+  }
+
+  for (int i = 0; i < n - 1; i++) {
+    float w0 = cfg.dac2_cal_weight[i];
+    float w1 = cfg.dac2_cal_weight[i + 1];
+    if (weightG >= w0 && weightG <= w1) {
+      float m0 = (float)cfg.dac2_cal_mv[i];
+      float m1 = (float)cfg.dac2_cal_mv[i + 1];
       if (w1 <= w0)
         return cfg.dac2_cal_mv[i];
       float t = (weightG - w0) / (w1 - w0);
-      return (uint16_t)(m0 + t * (m1 - m0));
+      float mvF = m0 + t * (m1 - m0);
+      if (mvF < 0.f)
+        mvF = 0.f;
+      if (mvF > 10000.f)
+        mvF = 10000.f;
+      return (uint16_t)(mvF + 0.5f);
     }
   }
-  return cfg.dac2_cal_mv[0];
+  return (uint16_t)constrain((int)cfg.dac2_cal_mv[n - 1], 0, 10000);
 }
 
 void setDac2Output(uint16_t mv) {
@@ -1619,7 +1891,7 @@ void setup() {
 
   loadConfig();
 
-  Serial.printf("\n\n=== Easylogger v2.0 ===\n");
+  Serial.printf("\n\n=== Easylogger v2.2.0 ===\n");
   Serial.println("ℹ️  En cas d'échec WiFi, l'AtomS3 démarrera en mode AP "
                  "(réseau Easylogger-XXXX)");
 

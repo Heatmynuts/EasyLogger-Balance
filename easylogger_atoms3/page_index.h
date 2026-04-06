@@ -1,4 +1,4 @@
-const char PAGE_INDEX[] PROGMEM = R"HTML(
+const char PAGE_INDEX_P1[] PROGMEM = R"HTMLP1(
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -560,6 +560,9 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
             </div>
         </div>
 
+)HTMLP1";
+const char PAGE_INDEX_P2[] PROGMEM = R"HTMLP2(
+
         <!-- --- TAB: PARAMÈTRES --- -->
         <div id="tab-config" class="tab-content max-w-4xl mx-auto">
             <h1 class="text-xl font-bold text-slate-800 mb-6 border-b border-slate-200 pb-3">Paramètres</h1>
@@ -780,6 +783,9 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
             </div>
         </div>
         
+)HTMLP2";
+const char PAGE_INDEX_P3[] PROGMEM = R"HTMLP3(
+
         <!-- --- TAB: DAC/DIAG --- -->
         <div id="tab-dac" class="tab-content max-w-4xl mx-auto">
             <!-- Contrôle en temps réel (poids + sortie DAC) -->
@@ -819,48 +825,45 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
                         <span class="slider"></span>
                     </label>
                 </div>
-                 <div class="grid grid-cols-2 gap-6 mb-8">
+                 <input type="hidden" name="dac2_n" id="dac2_n" value="%DAC2_N%">
+                 <div class="grid grid-cols-2 gap-6 mb-6 text-xs text-slate-600">
                         <div>
-                            <label class="block text-xs uppercase font-bold text-slate-400 mb-1" style="font-size: 10px;">Range Min (g)</label>
-                            <input name="dac2min" type="number" step="0.1" value="%DAC2MIN%">
+                            <span class="block text-xs uppercase font-bold text-slate-400 mb-1" style="font-size: 10px;">1er point cal. (g)</span>
+                            <span class="font-mono font-semibold">%DAC2MIN%</span>
                         </div>
                         <div>
-                            <label class="block text-xs uppercase font-bold text-slate-400 mb-1" style="font-size: 10px;">Range Max (g)</label>
-                            <input name="dac2max" type="number" step="0.1" value="%DAC2MAX%">
+                            <span class="block text-xs uppercase font-bold text-slate-400 mb-1" style="font-size: 10px;">Dernier point cal. (g)</span>
+                            <span class="font-mono font-semibold">%DAC2MAX%</span>
                         </div>
                     </div>
-                    
-                    <h3 class="text-xs font-bold uppercase tracking-widest text-blue-600 mb-4 border-b border-blue-100 pb-2">6-Point Calibration Table</h3>
+                    <p class="text-xs text-slate-500 mb-4">Sous la plage calibrée (poids inférieur au 1er point) &rarr; sortie <strong>0 V</strong>. Au-dessus du dernier point &rarr; <strong>10 V</strong>. Poids négatifs autorisés. Entre <strong>5 et 20</strong> points.</p>
+
+                    <label class="flex items-center gap-3 mb-4 cursor-pointer">
+                        <input type="checkbox" name="dac2smooth" id="dac2smooth" %DAC2SMOOTH_CHECK%>
+                        <span class="text-xs font-bold text-slate-600">Courbe lissée (régression quadratique, moindres carrés)</span>
+                    </label>
+
+                    <h3 class="text-xs font-bold uppercase tracking-widest text-blue-600 mb-4 border-b border-blue-100 pb-2">Table de calibration (5 à 20 points)</h3>
                     <div class="bg-slate-50 rounded p-4 border border-slate-200">
                         <div class="grid grid-cols-2 gap-4 mb-2 text-xs uppercase font-bold text-slate-400 text-center" style="font-size: 10px;">
-                            <div>Weight (g)</div>
-                            <div>Output (mV)</div>
+                            <div>Poids (g)</div>
+                            <div>Sortie (mV)</div>
                         </div>
-                         <div class="block">
-                            <div class="grid grid-cols-2 gap-4 mb-2">
-                                <input name="dac2w0" type="number" step="0.01" value="%DAC2W0%" class="text-center">
-                                <input name="dac2m0" type="number" min="0" max="10000" value="%DAC2M0%" class="text-center font-mono text-blue-600">
-                            </div>
-                            <div class="grid grid-cols-2 gap-4 mb-2">
-                                <input name="dac2w1" type="number" step="0.01" value="%DAC2W1%" class="text-center">
-                                <input name="dac2m1" type="number" min="0" max="10000" value="%DAC2M1%" class="text-center font-mono text-blue-600">
-                            </div>
-                            <div class="grid grid-cols-2 gap-4 mb-2">
-                                <input name="dac2w2" type="number" step="0.01" value="%DAC2W2%" class="text-center">
-                                <input name="dac2m2" type="number" min="0" max="10000" value="%DAC2M2%" class="text-center font-mono text-blue-600">
-                            </div>
-                             <div class="grid grid-cols-2 gap-4 mb-2">
-                                <input name="dac2w3" type="number" step="0.01" value="%DAC2W3%" class="text-center">
-                                <input name="dac2m3" type="number" min="0" max="10000" value="%DAC2M3%" class="text-center font-mono text-blue-600">
-                            </div>
-                             <div class="grid grid-cols-2 gap-4 mb-2">
-                                <input name="dac2w4" type="number" step="0.01" value="%DAC2W4%" class="text-center">
-                                <input name="dac2m4" type="number" min="0" max="10000" value="%DAC2M4%" class="text-center font-mono text-blue-600">
-                            </div>
-                             <div class="grid grid-cols-2 gap-4 mb-2">
-                                <input name="dac2w5" type="number" step="0.01" value="%DAC2W5%" class="text-center">
-                                <input name="dac2m5" type="number" min="0" max="10000" value="%DAC2M5%" class="text-center font-mono text-blue-600">
-                            </div>
+                         <div class="block" id="dac-cal-container">
+                            %DAC2CAL_ROWS%
+                        </div>
+                        <div class="flex gap-3 mt-4">
+                            <button type="button" id="dac-cal-add" class="flex-1 py-2 text-xs font-bold uppercase bg-blue-100 text-blue-800 rounded border border-blue-200 hover:bg-blue-200">Ajouter un point</button>
+                            <button type="button" id="dac-cal-remove" class="flex-1 py-2 text-xs font-bold uppercase bg-slate-200 text-slate-700 rounded border border-slate-300 hover:bg-slate-300">Supprimer un point</button>
+                        </div>
+                        <p id="dac-cal-warning" class="text-xs text-amber-700 mt-3 hidden"></p>
+                    </div>
+
+                    <div class="mt-6">
+                        <h3 class="text-xs font-bold uppercase tracking-widest text-slate-500 mb-2">Aperçu courbe (mV vs g)</h3>
+                        <p class="text-xs text-slate-500 mb-2">Bleu : segments linéaires. Orange : quadratique si l&apos;option est cochée.</p>
+                        <div class="bg-white rounded border border-slate-200 p-2 overflow-x-auto">
+                            <canvas id="dac-cal-chart" width="640" height="280" class="max-w-full"></canvas>
                         </div>
                     </div>
                      <div class="mt-6">
@@ -881,7 +884,7 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
             </div>
             <div class="flex flex-col">
                 <span class="text-xs text-slate-400 uppercase font-bold tracking-widest" style="font-size: 10px;">Firmware</span>
-                <span class="text-xl font-bold text-slate-800 text-blue-600">v2.4.1</span>
+                <span class="text-xl font-bold text-slate-800 text-blue-600">v2.2.0</span>
             </div>
         </div>
         <div class="text-right">
@@ -913,7 +916,227 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
         var el = document.getElementById('static-ip-fields');
         if (el && dhcp) el.style.display = dhcp.checked ? 'none' : 'grid';
     }
-    document.addEventListener('DOMContentLoaded', function() { toggleStaticIP(); });
+    const DAC_CAL_MIN = 5;
+    const DAC_CAL_MAX = 20;
+
+    function dacCalRenumber() {
+        var c = document.getElementById('dac-cal-container');
+        if (!c) return;
+        var rows = c.querySelectorAll('.dac-cal-row');
+        for (var idx = 0; idx < rows.length; idx++) {
+            var row = rows[idx];
+            var wIn = row.querySelector('input[type="number"]');
+            var mIn = row.querySelectorAll('input[type="number"]')[1];
+            if (wIn) wIn.name = 'dac2w' + idx;
+            if (mIn) mIn.name = 'dac2m' + idx;
+        }
+        var nEl = document.getElementById('dac2_n');
+        if (nEl) nEl.value = String(rows.length);
+    }
+
+    function dacCalAddRow() {
+        var c = document.getElementById('dac-cal-container');
+        if (!c) return;
+        var n = c.querySelectorAll('.dac-cal-row').length;
+        if (n >= DAC_CAL_MAX) return;
+        var div = document.createElement('div');
+        div.className = 'dac-cal-row grid grid-cols-2 gap-4 mb-2';
+        div.innerHTML = '<input type="number" step="0.01" value="0" class="text-center">' +
+            '<input type="number" min="0" max="10000" value="0" class="text-center font-mono text-blue-600">';
+        c.appendChild(div);
+        dacCalRenumber();
+        drawDacCalChart();
+    }
+
+    function dacCalRemoveRow() {
+        var c = document.getElementById('dac-cal-container');
+        if (!c) return;
+        var rows = c.querySelectorAll('.dac-cal-row');
+        if (rows.length <= DAC_CAL_MIN) return;
+        rows[rows.length - 1].remove();
+        dacCalRenumber();
+        drawDacCalChart();
+    }
+
+    function dacCalCollectSorted() {
+        var c = document.getElementById('dac-cal-container');
+        if (!c) return [];
+        var pts = [];
+        c.querySelectorAll('.dac-cal-row').forEach(function(row) {
+            var ins = row.querySelectorAll('input[type="number"]');
+            if (ins.length < 2) return;
+            var wf = parseFloat(ins[0].value);
+            var mi = parseInt(ins[1].value, 10);
+            if (isNaN(wf)) return;
+            if (isNaN(mi)) mi = 0;
+            mi = Math.min(10000, Math.max(0, mi));
+            pts.push({ w: wf, m: mi });
+        });
+        pts.sort(function(a, b) { return a.w - b.w; });
+        return pts;
+    }
+
+    function fitDacQuadraticJs(pts) {
+        if (pts.length < 3) return null;
+        var n = pts.length;
+        var S1 = 0, S2 = 0, S3 = 0, S4 = 0, T0 = 0, T1 = 0, T2 = 0;
+        for (var i = 0; i < n; i++) {
+            var wi = pts[i].w, vi = pts[i].m;
+            var wi2 = wi * wi;
+            S1 += wi; S2 += wi2; S3 += wi2 * wi; S4 += wi2 * wi2;
+            T0 += vi; T1 += vi * wi; T2 += vi * wi2;
+        }
+        var aug = [
+            [n, S1, S2, T0],
+            [S1, S2, S3, T1],
+            [S2, S3, S4, T2]
+        ];
+        for (var col = 0; col < 3; col++) {
+            var piv = col;
+            for (var r = col + 1; r < 3; r++) {
+                if (Math.abs(aug[r][col]) > Math.abs(aug[piv][col])) piv = r;
+            }
+            if (Math.abs(aug[piv][col]) < 1e-12) return null;
+            if (piv !== col) {
+                var tmp = aug[col]; aug[col] = aug[piv]; aug[piv] = tmp;
+            }
+            var div = aug[col][col];
+            for (var c = col; c < 4; c++) aug[col][c] /= div;
+            for (var r = 0; r < 3; r++) {
+                if (r === col) continue;
+                var f = aug[r][col];
+                for (var c2 = col; c2 < 4; c2++) aug[r][c2] -= f * aug[col][c2];
+            }
+        }
+        return [aug[0][3], aug[1][3], aug[2][3]];
+    }
+
+    function evalSegmentMvJs(pts, g) {
+        if (pts.length < 2) return 0;
+        var w0 = pts[0].w, w1 = pts[pts.length - 1].w;
+        if (g < w0) return 0;
+        if (g > w1) return 10000;
+        for (var i = 0; i < pts.length - 1; i++) {
+            var a = pts[i], b = pts[i + 1];
+            if (g >= a.w && g <= b.w) {
+                if (b.w <= a.w) return a.m;
+                var t = (g - a.w) / (b.w - a.w);
+                return a.m + t * (b.m - a.m);
+            }
+        }
+        return pts[pts.length - 1].m;
+    }
+
+    function evalQuadMvJs(coef, g) {
+        if (!coef) return 0;
+        var mv = coef[0] + coef[1] * g + coef[2] * g * g;
+        return Math.max(0, Math.min(10000, mv));
+    }
+
+    function drawDacCalChart() {
+        var canvas = document.getElementById('dac-cal-chart');
+        if (!canvas || !canvas.getContext) return;
+        var ctx = canvas.getContext('2d');
+        var W = canvas.width, H = canvas.height;
+        ctx.clearRect(0, 0, W, H);
+        ctx.fillStyle = '#f8fafc';
+        ctx.fillRect(0, 0, W, H);
+        var pts = dacCalCollectSorted();
+        var warnEl = document.getElementById('dac-cal-warning');
+        if (warnEl) {
+            warnEl.classList.add('hidden');
+            warnEl.textContent = '';
+        }
+        if (pts.length < 2) return;
+        for (var du = 0; du < pts.length - 1; du++) {
+            if (Math.abs(pts[du + 1].w - pts[du].w) < 1e-4) {
+                if (warnEl) {
+                    warnEl.textContent = 'Deux points ont le même poids — enregistrement sera refusé.';
+                    warnEl.classList.remove('hidden');
+                }
+                break;
+            }
+        }
+        for (var dm = 0; dm < pts.length - 1; dm++) {
+            if (pts[dm + 1].m < pts[dm].m - 0.5) {
+                if (warnEl) {
+                    warnEl.textContent = 'La tension diminue quand le poids augmente sur un segment (autorisé). Vérifiez l\'aperçu.';
+                    warnEl.classList.remove('hidden');
+                }
+                break;
+            }
+        }
+        var wMin = pts[0].w, wMax = pts[pts.length - 1].w;
+        var pad = 44;
+        var span = (wMax - wMin) || 1;
+        function xOf(g) { return pad + (g - wMin) / span * (W - 2 * pad); }
+        function yOf(mv) { return pad + (10000 - mv) / 10000 * (H - 2 * pad); }
+        ctx.strokeStyle = '#e2e8f0';
+        ctx.lineWidth = 1;
+        for (var k = 0; k <= 10; k++) {
+            var mvGrid = k * 1000;
+            var yg = yOf(mvGrid);
+            ctx.beginPath();
+            ctx.moveTo(pad, yg);
+            ctx.lineTo(W - pad, yg);
+            ctx.stroke();
+            ctx.fillStyle = '#94a3b8';
+            ctx.font = '10px sans-serif';
+            ctx.fillText((mvGrid / 1000) + 'V', 4, yg + 3);
+        }
+        var steps = 200;
+        ctx.strokeStyle = '#2563eb';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        for (var s = 0; s <= steps; s++) {
+            var g = wMin + (s / steps) * (wMax - wMin);
+            var mvSeg = evalSegmentMvJs(pts, g);
+            var xs = xOf(g), ys = yOf(mvSeg);
+            if (s === 0) ctx.moveTo(xs, ys); else ctx.lineTo(xs, ys);
+        }
+        ctx.stroke();
+        var smooth = document.getElementById('dac2smooth');
+        if (smooth && smooth.checked && pts.length >= 3) {
+            var coef = fitDacQuadraticJs(pts);
+            if (coef) {
+                ctx.strokeStyle = '#ea580c';
+                ctx.setLineDash([5, 4]);
+                ctx.beginPath();
+                for (var s2 = 0; s2 <= steps; s2++) {
+                    var g2 = wMin + (s2 / steps) * (wMax - wMin);
+                    var mvQ = evalQuadMvJs(coef, g2);
+                    var xq = xOf(g2), yq = yOf(mvQ);
+                    if (s2 === 0) ctx.moveTo(xq, yq); else ctx.lineTo(xq, yq);
+                }
+                ctx.stroke();
+                ctx.setLineDash([]);
+            }
+        }
+        pts.forEach(function(p) {
+            var xm = xOf(p.w), ym = yOf(Math.max(0, Math.min(10000, p.m)));
+            ctx.fillStyle = '#2563eb';
+            ctx.beginPath();
+            ctx.arc(xm, ym, 5, 0, Math.PI * 2);
+            ctx.fill();
+        });
+    }
+
+    document.addEventListener('DOMContentLoaded', function() {
+        toggleStaticIP();
+        var calC = document.getElementById('dac-cal-container');
+        if (calC) {
+            calC.addEventListener('input', drawDacCalChart);
+            calC.addEventListener('change', drawDacCalChart);
+        }
+        var addBtn = document.getElementById('dac-cal-add');
+        var rmBtn = document.getElementById('dac-cal-remove');
+        var smCh = document.getElementById('dac2smooth');
+        if (addBtn) addBtn.addEventListener('click', dacCalAddRow);
+        if (rmBtn) rmBtn.addEventListener('click', dacCalRemoveRow);
+        if (smCh) smCh.addEventListener('change', drawDacCalChart);
+        dacCalRenumber();
+        drawDacCalChart();
+    });
 
     function showToast(message, type) {
         type = type || 'success';
@@ -933,6 +1156,7 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
 
     function submitConfigForm(event) {
         event.preventDefault();
+        if (typeof dacCalRenumber === 'function') dacCalRenumber();
         var form = document.getElementById('config-form');
         if (!form) return false;
         var formData = new FormData(form);
@@ -1171,4 +1395,4 @@ const char PAGE_INDEX[] PROGMEM = R"HTML(
 </script>
 </body>
 </html>
-)HTML";
+)HTMLP3";
